@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "id": "airzy.vpn",
+  "name": "TunnelHub",
+  "version": "1.0.0",
+  "author": "Airzy",
+  "license": "MIT",
+  "description": "TunnelHub VPN profile and connection manager for Omarchy.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "TunnelHub",
+    "description": "Import profiles and manage VPN connections.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 10,
+      "azureCaPath": "",
+      "azureExperimentalCompat": false
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 3600,
+        "step": 5,
+        "defaultValue": 10
+      },
+      {
+        "key": "azureCaPath",
+        "type": "string",
+        "label": "Azure trusted CA certificate path",
+        "defaultValue": ""
+      },
+      {
+        "key": "azureExperimentalCompat",
+        "type": "boolean",
+        "label": "Azure experimental compatibility",
+        "defaultValue": false
+      }
+    ]
+  }
+}

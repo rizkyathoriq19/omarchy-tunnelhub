@@ -1,0 +1,3 @@
+#!/bin/sh
+# Only the native sudo askpass pipe receives the response. Ignore prompt argv.
+exec /usr/bin/python3 "$(dirname "$0")/permission.py" askpass

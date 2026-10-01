@@ -1,0 +1,3 @@
+#!/bin/sh
+# OpenP2S 0.2.1 has no askpass flag/config: keep its exact command boundary.
+exec /usr/bin/sudo -A "$@"
