@@ -171,15 +171,8 @@ openp2s disconnect
 Use **Import profile…** or `I`, then use its switch. The launcher uses your configured trusted CA and optional compatibility setting. Status is polled independently for Azure and NetworkManager; right-click/`D` disconnect the shown VPN.
 Changes to this user plugin hot-reload; no shell restart is required.
 
-### Safe regression checks
+### Verification
 
-From the plugin directory, run `python3 test_profiles.py`, `python3 test_status.py`,
-`python3 test_gui.py`, `python3 test_service.py` and `python3 test_permission.py`.
-The tests use mocked backends, offscreen QML and synthetic in-memory passwords;
-only the GUI lifecycle check starts/stops its uniquely named benign user unit.
-They never invoke real sudo, VPN connections or network mutations. The permission
-check covers owner/capability validation, transport, FIFO, stale IDs, cancellation,
-timeouts, broker duplication/EOF, actual keyboard focus/Enter/Escape routing and
-verbose Quickshell log leak checks. The Service check also parses both QML files.
-A real compositor/sudo authentication/retry/cleanup exercise remains manual UAT,
-not proof supplied by these synthetic checks.
+Development regression tests are maintained separately and are not shipped with
+this plugin. Real compositor/sudo authentication, retry and cleanup still require
+manual UAT; synthetic checks do not establish live VPN connectivity.
