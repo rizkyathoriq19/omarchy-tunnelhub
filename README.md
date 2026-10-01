@@ -1,5 +1,7 @@
 # TunnelHub — Omarchy VPN Widget
 
+![TunnelHub preview](preview.png)
+
 ## Install / remove the plugin
 
 After the maintainer publishes the plugin source, install it with:
