@@ -48,6 +48,65 @@ and `curl` for the public-IP display.
 - `D`: disconnect; Escape: close.
 - Switching profiles disconnects the current NetworkManager VPN first.
 
+## NetworkManager certificate passwords
+
+The native OpenVPN importer does not preserve an `.ovpn` `askpass FILE`
+directive or import its file's password (verified with NetworkManager OpenVPN
+1.12.5). Direct OpenVPN and a NetworkManager profile therefore have different
+credential handling. For new imports, the plugin records only the original
+`.ovpn` path against the newly imported NetworkManager UUID in
+`$XDG_STATE_HOME/airzy.vpn/openvpn-sources.json` (mode 0600, atomic replacement).
+**Profiles imported before this support need one reimport through this panel**;
+existing profiles have no source mapping and continue to prompt manually. Keep
+the source file in place; no source/UUID guessing or password copying is done.
+
+For a known password-protected certificate profile, NetworkManager must mark
+`cert-pass` as agent-owned or not-saved. Native imports can omit this flag even
+when PKCS12 detection succeeds; then `nmcli --ask` fails before requesting a
+password. Set the nonpersistent-secret policy (the flag itself is saved):
+
+```bash
+nmcli connection modify uuid YOUR_PROFILE_UUID +vpn.data cert-pass-flags=2
+```
+
+This does not connect or store a password. Do not apply it blindly to profiles
+with unencrypted keys; it makes the certificate-password request eligible.
+
+On an exact `vpn.secrets.cert-pass` request, the helper locally reads the source
+`.ovpn`, skips inline blocks and resolves a quoted/commented `askpass FILE`
+relative to the source directory (absolute paths also work). It reads only a
+bounded first line of the referenced regular file and sends it through private
+stdin to nmcli. No shell commands are executed. Changing the source/password
+file takes effect on the next connection. The password is never stored in the
+registry, argv, environment, logs or temporary files. Protect the source and
+password file yourself; the helper reads them with your normal-user permissions.
+
+Absent directives, missing/unreadable/invalid files or unregistered sources fall
+back to the masked panel field. The file is tried only once per activation; a
+fresh native request after rejection prompts manually instead of retrying the
+same file forever. If nmcli exits on rejection, correct the file or retry the
+profile. Deleting a profile in the panel also removes its source mapping, never
+its source or password file.
+
+When manual entry is needed, the panel opens a masked **Certificate
+password** field: enter the password that unlocks the certificate/private key,
+**not your sudo/system password**. Submit/Enter passes it only through private
+stdin pipes to native `nmcli --ask`. Cancel/Escape, closing the panel, EOF/reload
+or a 90-second connection deadline stops the helper; connection status still
+comes from NetworkManager. Once credentials have been submitted, stopping nmcli
+does not guarantee rollback of a NetworkManager activation; refresh and use the
+profile switch to disconnect if it completed. Wrong passwords fail or trigger a fresh native request;
+retry the profile after a failed attempt. Backend output is discarded, so it
+cannot echo a password into panel errors or logs. Responses are not cached or
+stored by the plugin. Qt/Python memory erasure, OS swap and other same-user
+processes are outside this protection.
+
+Only the native `vpn.secrets.cert-pass` prompt is supported here; other requests
+fail closed instead of being labelled as certificate or sudo passwords. For
+other authentication types or persistent credentials, use a trusted native
+NetworkManager editor/secret agent and its storage policy. Do not put passwords
+in shell arguments or manually copy an askpass file into plugin state.
+
 ## Azure VPN with OpenP2S
 
 The panel imports OpenVPN `.ovpn` and WireGuard `.conf` through native `nmcli connection import type openvpn/wireguard file PATH` using zenity. Backend/permission failures are shown without logging profile contents. WireGuard filenames must be valid interface names followed by `.conf`. Cancellation does nothing. No other file formats are imported.

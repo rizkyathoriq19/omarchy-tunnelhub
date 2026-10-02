@@ -47,31 +47,70 @@ Panel {
     vpn.refresh()
 
     Qt.callLater(function() {
-      if (vpn.permissionRequest) permissionField.forceActiveFocus()
+      if (vpn.authRequest) permissionField.forceActiveFocus()
       else keyCatcher.forceActiveFocus()
     })
   } else {
     permissionField.text = ""
-    vpn.cancelPermission()
+    vpn.cancelAuth()
   }
 
   Component.onDestruction: {
     permissionField.text = ""
-    vpn.cancelPermission()
+    vpn.cancelAuth()
   }
 
   Service {
     id: vpn
     settings: root.settings
-    onPermissionRequestChanged: {
+    onAuthRequestChanged: {
       permissionField.text = ""
-      if (!permissionRequest) return
+      if (!authRequest) return
       root.cursorActive = false
       root.open()
       panelFlick.contentY = 0
       Qt.callLater(function() {
-        if (vpn.permissionRequest && root.opened) permissionField.forceActiveFocus()
+        if (vpn.authRequest && root.opened) permissionField.forceActiveFocus()
       })
+    }
+  }
+
+  component DeleteControl: Row {
+    id: deletion
+    property string target: ""
+    property string label: ""
+    property bool azureRegistry: false
+    property bool armed: false
+    signal confirmed()
+    spacing: Style.space(4)
+    onTargetChanged: armed = false
+    onEnabledChanged: if (!enabled) armed = false
+    Connections {
+      target: root
+      function onOpenedChanged() { deletion.armed = false }
+    }
+    Button {
+      focusable: true
+      text: deletion.armed ? "Confirm" : "Delete"
+      Accessible.role: Accessible.Button
+      Accessible.name: (deletion.armed ? "Confirm delete " : "Delete ") + deletion.label
+      Accessible.onPressAction: clicked()
+      tooltipText: deletion.label + " · " + (deletion.azureRegistry ? "Remove registry entry only; source files kept" : "Delete this NetworkManager profile; an active connection may stop")
+      onClicked: {
+        if (!deletion.armed) deletion.armed = true
+        else { deletion.armed = false; deletion.confirmed() }
+      }
+      Keys.onEscapePressed: deletion.armed = false
+    }
+    Button {
+      visible: deletion.armed
+      focusable: true
+      text: "Cancel"
+      Accessible.role: Accessible.Button
+      Accessible.name: "Cancel delete " + deletion.label
+      Accessible.onPressAction: clicked()
+      onClicked: deletion.armed = false
+      Keys.onEscapePressed: deletion.armed = false
     }
   }
 
@@ -106,6 +145,13 @@ Panel {
     )
   }
 
+  function disconnectSelected() {
+    var profile = selectedProfile()
+    if (profile && profile.uuid && ["connected", "connecting", "disconnecting"].indexOf(vpn.nmRowStatus(profile.uuid)) !== -1)
+      vpn.disconnectNm(profile.uuid)
+    else vpn.disconnectActive()
+  }
+
   function activateCursor() {
     var profile = selectedProfile()
 
@@ -114,7 +160,7 @@ Panel {
 
     if (profile.type === "azure") {
       if (profile.path !== undefined) vpn.toggleAzure(profile.path)
-    } else vpn.toggleProfile(profile.name)
+    } else vpn.toggleProfile(profile.uuid)
   }
 
   IpcHandler {
@@ -146,14 +192,14 @@ Panel {
     }
 
     function disconnect(): string {
-      vpn.disconnectActive()
+      root.disconnectSelected()
       return "ok"
     }
 
     function status(): string {
       return vpn.active
         ? "Connected: " + vpn.activeProfile
-        : "Disconnected"
+        : vpn.statusTitle
     }
   }
 
@@ -176,8 +222,7 @@ Panel {
 
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) {
-        if (vpn.active || vpn.azureOperation.running)
-          vpn.disconnectActive()
+        root.disconnectSelected()
       } else if (buttonCode === Qt.MiddleButton) {
         vpn.refresh()
       } else {
@@ -194,7 +239,7 @@ Panel {
     bar: root.bar
     open: root.opened
 
-    focusTarget: vpn.permissionRequest ? permissionField : keyCatcher
+    focusTarget: vpn.authRequest ? permissionField : keyCatcher
 
     contentWidth:
       panel.fittedContentWidth(Style.space(380))
@@ -207,7 +252,7 @@ Panel {
 
     PanelKeyCatcher {
       id: keyCatcher
-      blocked: vpn.permissionRequest !== ""
+      blocked: vpn.authRequest !== ""
 
       anchors.fill: parent
 
@@ -240,7 +285,7 @@ Panel {
           vpn.profileAction("import")
 
         else if (t === "d" || t === "D")
-          vpn.disconnectActive()
+          root.disconnectSelected()
       }
 
       Flickable {
@@ -266,22 +311,22 @@ Panel {
           width: panelFlick.width
           spacing: Style.space(12)
 
-          // Inline sudo permission prompt; native OAuth/browser flow is untouched.
+          // Separate certificate and sudo requests share only the masked native field.
           Column {
             id: permissionPrompt
             width: parent.width
-            visible: vpn.permissionRequest !== ""
+            visible: vpn.authRequest !== ""
             spacing: Style.space(8)
             Text {
               width: parent.width
-              text: "System permission required"
+              text: vpn.certificatePrompt ? "VPN certificate password required" : "System permission required"
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
             }
             Text {
               width: parent.width
-              text: "Enter your system password for sudo. Cancel denies this request."
+              text: vpn.certificatePrompt ? "Enter the password that unlocks your VPN certificate/private key, not your system password. Cancel stops this connection attempt." : "Enter your system password for sudo. Cancel denies this request."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -292,21 +337,21 @@ Panel {
               width: parent.width
               password: true
               maximumLength: 4092
-              placeholderText: "System password"
+              placeholderText: vpn.certificatePrompt ? "Certificate password" : "System password"
               foreground: root.foreground
               accent: root.accent
               inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
-              Accessible.name: "System password for sudo"
+              Accessible.name: vpn.certificatePrompt ? "VPN certificate password" : "System password for sudo"
               function submit() {
                 var response = text
                 text = ""
-                vpn.respondPermission(response)
+                vpn.respondAuth(response)
                 response = ""
               }
               onAccepted: submit()
               Keys.onReturnPressed: function(event) { event.accepted = true; submit() }
               Keys.onEnterPressed: function(event) { event.accepted = true; submit() }
-              Keys.onEscapePressed: { text = ""; vpn.cancelPermission() }
+              Keys.onEscapePressed: { text = ""; vpn.cancelAuth() }
             }
             Row {
               spacing: Style.space(8)
@@ -314,12 +359,12 @@ Panel {
                 id: permissionSubmit
                 focusable: true
                 Accessible.role: Accessible.Button
-                Accessible.name: "Submit system password"
+                Accessible.name: vpn.certificatePrompt ? "Submit certificate password" : "Submit system password"
                 Accessible.onPressAction: clicked()
                 text: "Submit"
                 enabled: permissionField.text.length > 0
                 onClicked: permissionField.submit()
-                Keys.onEscapePressed: { permissionField.text = ""; vpn.cancelPermission() }
+                Keys.onEscapePressed: { permissionField.text = ""; vpn.cancelAuth() }
               }
               Button {
                 id: permissionCancel
@@ -328,8 +373,8 @@ Panel {
                 Accessible.name: "Cancel permission request"
                 Accessible.onPressAction: clicked()
                 text: "Cancel"
-                onClicked: { permissionField.text = ""; vpn.cancelPermission() }
-                Keys.onEscapePressed: { permissionField.text = ""; vpn.cancelPermission() }
+                onClicked: { permissionField.text = ""; vpn.cancelAuth() }
+                Keys.onEscapePressed: { permissionField.text = ""; vpn.cancelAuth() }
               }
             }
           }
@@ -539,7 +584,7 @@ Panel {
                     Style.space(4)
 
                   color: {
-                    if (vpn.nmProfile === modelData.name)
+                    if (vpn.nmRowStatus(modelData.uuid) === "connected")
                       return Qt.rgba(
                         root.accent.r,
                         root.accent.g,
@@ -577,12 +622,12 @@ Panel {
                     Text {
                       id: nmIndicator
                       text:
-                        vpn.nmProfile === modelData.name
+                        vpn.nmRowStatus(modelData.uuid) === "connected"
                           ? "●"
                           : "○"
 
                       color:
-                        vpn.nmProfile === modelData.name
+                        vpn.nmRowStatus(modelData.uuid) === "connected"
                           ? root.accent
                           : root.dim
 
@@ -595,7 +640,7 @@ Panel {
 
                     Column {
                       width:
-                        parent.width - nmIndicator.width - nmSwitch.width - parent.spacing * 2
+                        Math.max(0, parent.width - nmIndicator.width - nmSwitch.width - nmDelete.width - parent.spacing * 3)
 
                       spacing: Style.space(1)
 
@@ -622,7 +667,7 @@ Panel {
                         width: parent.width
 
                         text:
-                          vpn.nmProfile === modelData.name ? "connected" : "disconnected"
+                          vpn.nmRowStatus(modelData.uuid)
 
                         color:
                           root.dim
@@ -640,8 +685,8 @@ Panel {
                     ToggleSwitch {
                       id: nmSwitch
                       anchors.verticalCenter: parent.verticalCenter
-                      checked: vpn.nmProfile === modelData.name
-                      busy: vpn.actionRunning || vpn.importing
+                      checked: vpn.nmRowStatus(modelData.uuid) === "connected"
+                      busy: vpn.importing || (vpn.nmRowStatus(modelData.uuid) !== "connecting" && (!vpn.nmStateKnown || vpn.actionRunning))
                       foreground: root.foreground
                       accent: root.accent
                       hasCursor: root.cursorActive && root.profileIndex === index
@@ -652,14 +697,22 @@ Panel {
                       onToggled: {
                         root.cursorActive = true
                         root.profileIndex = index
-                        vpn.toggleProfile(modelData.name)
+                        vpn.toggleProfile(modelData.uuid)
                       }
+                    }
+                    DeleteControl {
+                      id: nmDelete
+                      anchors.verticalCenter: parent.verticalCenter
+                      target: modelData.uuid
+                      label: modelData.name + " (" + modelData.uuid + ")"
+                      enabled: vpn.nmStateKnown && !vpn.actionRunning && !vpn.importing && !vpn.authRequest
+                      onConfirmed: vpn.deleteProfile(target)
                     }
                   }
 
                   HoverHandler { id: nmHover }
                   ToolTip.visible: nmHover.hovered
-                  ToolTip.text: modelData.name + " · " + (vpn.nmProfile === modelData.name ? "connected" : "disconnected")
+                  ToolTip.text: modelData.name + " · " + modelData.uuid + " · " + (vpn.nmRowStatus(modelData.uuid))
                 }
               }
 
@@ -675,7 +728,7 @@ Panel {
                     ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.18)
                     : (root.cursorActive && root.profileIndex === vpn.profiles.length + index
                       ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08) : "transparent")
-                  enabled: !vpn.importing && !vpn.actionRunning && !vpn.azureOperation.stopping && (vpn.azure.path === modelData || vpn.azureOperation.path === modelData || (!vpn.azure.connected && !vpn.azureOperation.running && vpn.azure.state === "disconnected"))
+                  enabled: !vpn.importing && !vpn.actionRunning && !vpn.azureOperation.stopping && (vpn.azure.path === modelData || vpn.azureOperation.path === modelData || (!vpn.azure.connected && vpn.azureOperationKnown && !vpn.azureOperation.running && vpn.azure.state === "disconnected"))
                   Row {
                     id: azureRow
                     anchors {
@@ -694,7 +747,7 @@ Panel {
                       font.pixelSize: Style.font.body
                     }
                     Column {
-                      width: parent.width - azureIndicator.width - azureSwitch.width - parent.spacing * 2
+                      width: Math.max(0, parent.width - azureIndicator.width - azureSwitch.width - azureDelete.width - parent.spacing * 3)
                       spacing: Style.space(1)
                       Text {
                         width: parent.width
@@ -730,6 +783,15 @@ Panel {
                         root.profileIndex = vpn.profiles.length + index
                         vpn.toggleAzure(modelData)
                       }
+                    }
+                    DeleteControl {
+                      id: azureDelete
+                      anchors.verticalCenter: parent.verticalCenter
+                      target: modelData
+                      label: modelData.split("/").pop()
+                      azureRegistry: true
+                      enabled: vpn.canRemoveAzure(target) && !vpn.authRequest
+                      onConfirmed: vpn.removeAzure(target)
                     }
                   }
                   HoverHandler { id: azureHover }

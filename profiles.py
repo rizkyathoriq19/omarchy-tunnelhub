@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import signal
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 from permission import Lease
+import ovpn_source
 
 def connection_settings():
     # Read the same inline widget settings in actions and the durable supervisor.
@@ -48,24 +50,106 @@ def load():
     return data
 
 
+def save(paths):
+    STORE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temp = tempfile.mkstemp(dir=STORE.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(paths, stream)
+        os.replace(temp, STORE)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
 def register(path):
     paths = load()
     if path not in paths:
         paths.append(path)
-        STORE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        fd, temp = tempfile.mkstemp(dir=STORE.parent)
-        try:
-            with os.fdopen(fd, "w") as stream:
-                json.dump(paths, stream)
-            os.replace(temp, STORE)
-        finally:
-            if os.path.exists(temp):
-                os.unlink(temp)
+        save(paths)
     return paths
 
 
+def remove(path):
+    paths = load()
+    if path not in paths:
+        raise ValueError("Azure path is not registered.")
+    operation = operation_status()
+    if not operation.get("known", False) or operation["running"] or operation["stopping"] or status()["state"] != "disconnected":
+        raise ValueError("Disconnect VPN and confirm status before removing a profile.")
+    # Remove only the registry entry; source XML and certificates are untouched.
+    paths = [p for p in paths if p != path]
+    save(paths)
+    return {"azure": paths, "message": "Profile removed. Source files kept."}
+
+
+def delete_nm(profile):
+    if not ovpn_source.valid_uuid(profile):
+        raise ValueError("Select a profile UUID.")
+    sources = ovpn_source.load()
+    result = subprocess.run([require("nmcli"), "--wait", "30", "connection", "delete", "uuid", profile],
+                            capture_output=True, text=True, timeout=35)
+    if result.returncode:
+        raise ValueError("NetworkManager profile deletion failed. Refresh and retry.")
+    if profile in sources:
+        del sources[profile]
+        ovpn_source.save(sources)
+    return {"message": "Profile removed. Source files kept."}
+
+
+def prepare_nm_certificate(profile):
+    # New imports only. Native OpenVPN asks only when its key needs a password;
+    # this policy permits that request without storing the password in NM.
+    import re
+    result = subprocess.run([require("nmcli"), "-g", "vpn.data", "connection", "show", "uuid", profile],
+                            capture_output=True, text=True, timeout=15)
+    if result.returncode:
+        raise ValueError("Profile imported, but certificate secret policy could not be checked. Refresh before connecting.")
+    data = dict(item.strip().split(" = ", 1) for item in re.split(r"(?<!\\),", result.stdout.strip()) if " = " in item)
+    if data.get("connection-type") not in ("tls", "password-tls") or "cert-pass-flags" in data:
+        return
+    result = subprocess.run([require("nmcli"), "connection", "modify", "uuid", profile,
+                             "+vpn.data", "cert-pass-flags=2"], capture_output=True, text=True, timeout=15)
+    if result.returncode:
+        raise ValueError("Profile imported, but certificate secret policy setup failed. Refresh and repair cert-pass-flags before connecting.")
+    result = subprocess.run([require("nmcli"), "-g", "vpn.data", "connection", "show", "uuid", profile],
+                            capture_output=True, text=True, timeout=15)
+    if result.returncode or not re.search(r"(?:^|, )cert-pass-flags = 2(?:,|$)", result.stdout.strip()):
+        raise ValueError("Profile imported, but certificate secret policy verification failed. Refresh before connecting.")
+
+
+def nm_details(profile):
+    if not ovpn_source.valid_uuid(profile):
+        raise ValueError("Select a profile UUID.")
+    result = subprocess.run([require("nmcli"), "--escape", "no", "-g", "IP4.ADDRESS,IP6.ADDRESS", "connection", "show", "--active", "uuid", profile],
+                            capture_output=True, text=True, timeout=15)
+    if result.returncode:
+        raise ValueError("Could not read active VPN details.")
+    import ipaddress
+    addresses = []
+    for line in result.stdout.splitlines():
+        try:
+            addresses.append(str(ipaddress.ip_interface(line).ip))
+        except ValueError:
+            pass
+    address = addresses[0] if addresses else ""
+    # GENERAL.DEVICES/IP-IFACE refer to the VPN's physical parent, not its tun.
+    # Match native active VPN addresses to native kernel interfaces; never guess.
+    result = subprocess.run([require("ip"), "-j", "address", "show"], capture_output=True, text=True, timeout=5)
+    devices = json.loads(result.stdout) if result.returncode == 0 else []
+    matches = set()
+    for device in devices:
+        for item in device.get("addr_info", []):
+            try:
+                if str(ipaddress.ip_address(item.get("local", ""))) in addresses:
+                    matches.add(device["ifname"])
+            except ValueError:
+                pass
+    return {"uuid": profile, "address": address, "interface": matches.pop() if len(matches) == 1 else ""}
+
+
 def import_path(path):
-    if not path.startswith("/") or "\x00" in path or "\n" in path:
+    if not path.startswith("/") or any(c in path for c in "\x00\r\n"):
         raise ValueError("Select an absolute file path without newlines.")
     suffix = Path(path).suffix.lower()
     if suffix == ".xml":
@@ -74,10 +158,27 @@ def import_path(path):
     kind = {".ovpn": "openvpn", ".conf": "wireguard"}.get(suffix)
     if not kind:
         raise ValueError("Supported files: OpenVPN .ovpn, WireGuard .conf, Azure .xml.")
-    result = subprocess.run([require("nmcli"), "connection", "import", "type", kind, "file", path], capture_output=True, text=True)
+    env = dict(os.environ, LC_ALL="C")
+    result = subprocess.run([require("nmcli"), "connection", "import", "type", kind, "file", path],
+                            capture_output=True, text=True, timeout=30, env=env)
     if result.returncode:
         # Backend diagnostics can contain profile content; do not echo them into the panel.
         raise ValueError(f"NetworkManager {kind} import failed (exit {result.returncode}). Check the file, backend and NetworkManager permissions. WireGuard filenames must be valid interface names.")
+    if kind == "openvpn":
+        # Bind only the UUID returned by this import, never a global list diff.
+        match = re.fullmatch(r"Connection '[^\r\n]*' \(([0-9a-f-]{36})\) successfully added\.\n?", result.stdout)
+        profile = match[1] if match else ""
+        if not ovpn_source.valid_uuid(profile):
+            return {"message": "Profile imported, but its source could not be identified safely. Askpass-file support was not registered."}
+        verified = subprocess.run([require("nmcli"), "-g", "connection.uuid,connection.type,vpn.service-type",
+                                   "connection", "show", "uuid", profile],
+                                  capture_output=True, text=True, timeout=15, env=env)
+        if verified.returncode or verified.stdout.splitlines() != [profile, "vpn", "org.freedesktop.NetworkManager.openvpn"]:
+            raise ValueError("Profile imported, but its identity could not be verified. Source was not registered.")
+        sources = ovpn_source.load()
+        sources[profile] = path
+        ovpn_source.save(sources)
+        prepare_nm_certificate(profile)
     return {"message": "Profile imported."}
 
 
@@ -110,7 +211,7 @@ def launch(path):
     preflight(client, experimental)
     gui_environment()  # Fail before scheduling if native GUI prerequisites are missing.
     operation = operation_status()
-    if operation["running"] or operation["stopping"] or status()["state"] != "disconnected":
+    if not operation.get("known", False) or operation["running"] or operation["stopping"] or status()["state"] != "disconnected":
         raise ValueError("VPN is active, starting, or status unavailable. Disconnect/clean up before connecting again.")
     control("reset-failed", check=False)
     args = [require("systemd-run"), "--user", "--quiet", "--unit=" + UNIT,
@@ -171,14 +272,24 @@ def supervisor_path(pid):
 
 
 def operation_status():
-    empty = {"running": False, "stopping": False, "error": ""}
+    empty = {"known": False, "running": False, "stopping": False, "path": "",
+             "error": "VPN process status unavailable. Check the systemd user manager and refresh."}
     try:
         result = subprocess.run([require("systemctl"), "--user", "show", UNIT,
-                                 "--property=ActiveState,SubState,Result,ExecMainStatus,MainPID"],
+                                 "--property=LoadState,ActiveState,SubState,Result,ExecMainStatus,MainPID"],
                                 capture_output=True, text=True, timeout=5)
         if result.returncode:
             return empty
         values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        if (values.get("LoadState") not in ("loaded", "not-found")
+                or values.get("ActiveState") not in ("active", "activating", "deactivating", "inactive", "failed")
+                or not values.get("SubState") or "Result" not in values
+                or not values.get("ExecMainStatus", "").isdecimal()
+                or not values.get("MainPID", "").isdecimal()
+                or (values["LoadState"] == "not-found" and
+                    (values["ActiveState"] != "inactive" or values["SubState"] != "dead" or values["MainPID"] != "0"))
+                or (values["ActiveState"] == "inactive" and values["MainPID"] != "0")):
+            return empty
         failed = values.get("ActiveState") == "failed"
         code = values.get("ExecMainStatus", "")
         error = ""
@@ -187,7 +298,7 @@ def operation_status():
                      "5": "VPN cleanup incomplete. Retry Disconnect / clean up.",
                      "6": "VPN GUI backend could not start. Check installed GUI prerequisites."}.get(
                          code, "Connection failed or privilege/sign-in was cancelled. Check profile, browser sign-in, sudo permissions and gateway.")
-        return {"running": values.get("SubState") in ("running", "start", "start-pre", "start-post") or values.get("ActiveState") == "activating",
+        return {"known": True, "running": values.get("ActiveState") in ("active", "activating"),
                 "stopping": values.get("ActiveState") == "deactivating", "error": error,
                 "path": supervisor_path(values.get("MainPID", "0")) if values.get("ActiveState") in ("active", "activating", "deactivating") else ""}
     except (OSError, ValueError, subprocess.TimeoutExpired):
@@ -287,9 +398,13 @@ def status():
 
 def disconnect():
     operation = operation_status()
+    if not operation.get("known", False):
+        raise ValueError("VPN process status unavailable; no disconnect launched. Refresh and retry cleanup.")
     if operation["running"] or operation["stopping"]:
         control("stop")  # Cancels pending browser auth too; native SIGTERM owns cleanup.
-        if status()["state"] != "disconnected" or operation_status()["error"]:
+        operation = operation_status()
+        if (status()["state"] != "disconnected" or not operation.get("known", False)
+                or operation["running"] or operation["stopping"] or operation["error"]):
             raise ValueError("Disconnection/cleanup is not confirmed. Refresh and retry Disconnect / clean up.")
         return {"message": "Disconnected."}
     if status()["state"] not in ("connected", "reconnecting", "disconnecting", "stale"):
@@ -297,7 +412,9 @@ def disconnect():
     code = supervise([require("openp2s"), "disconnect"])
     if code:
         raise ValueError("Disconnect failed or graphical sudo was cancelled. Refresh and retry cleanup.")
-    if status()["state"] != "disconnected":
+    operation = operation_status()
+    if (status()["state"] != "disconnected" or not operation.get("known", False)
+            or operation["running"] or operation["stopping"]):
         raise ValueError("Disconnection is not confirmed. Refresh and retry cleanup.")
     control("reset-failed", check=False)  # Clear a prior unit failure only after native cleanup is confirmed.
     return {"message": "Disconnected."}
@@ -311,6 +428,12 @@ def main():
         return disconnect()
     if action == "list":
         return {"azure": load()}
+    if action == "details-nm":
+        return nm_details(sys.argv[2])
+    if action == "delete-nm":
+        return delete_nm(sys.argv[2])
+    if action == "remove":
+        return remove(sys.argv[2])
     if action == "launch":
         return launch(sys.argv[2])
     if action != "import":

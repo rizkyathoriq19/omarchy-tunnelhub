@@ -9,6 +9,23 @@ Item {
 
   // A separate stdin pipe carries responses; ordinary status never contains secrets.
   property string permissionRequest: ""
+  property string certificateRequest: ""
+  readonly property string authRequest: certificateRequest || permissionRequest
+  readonly property bool certificatePrompt: certificateRequest !== ""
+  function respondAuth(value) {
+    if (!certificateRequest) { respondPermission(value); return }
+    var ident = certificateRequest
+    certificateRequest = ""
+    if (!certificateProcess.running) return
+    if (value && value.length <= 4092 && !/[\x00-\x1f\x7f]/.test(value))
+      certificateProcess.write(ident + "\t" + value + "\n")
+    else { _nmAttemptCancelled = true; certificateProcess.write(ident + "\n") }
+  }
+  function cancelAuth() {
+    if (certificateProcess.running) { _nmAttemptCancelled = true; certificateProcess.write("CANCEL\n") }
+    certificateRequest = ""
+    cancelPermission()
+  }
   function respondPermission(value) {
     var ident = permissionRequest
     permissionRequest = ""
@@ -34,25 +51,27 @@ Item {
     onExited: { root.permissionRequest = ""; permissionRestart.restart() }
   }
   Timer { id: permissionRestart; interval: 500; onTriggered: permissionBridge.running = true }
-  Component.onDestruction: cancelPermission()
+  Component.onDestruction: cancelAuth()
 
   property var profiles: []
   property var azureProfiles: []
   property var azure: ({state: "unknown", connected: false, path: "", interface: "", address: ""})
-  property var azureOperation: ({running: false, stopping: false, error: ""})
-  readonly property bool azurePending: azureOperation.running && !azure.connected
+  property var azureOperation: ({known: false, running: null, stopping: null, error: ""})
+  readonly property bool azureOperationKnown: azureOperation.known === true && typeof azureOperation.running === "boolean" && typeof azureOperation.stopping === "boolean"
+  readonly property bool azurePending: azureOperation.running === true && !azure.connected
   readonly property string azureDisplayState: azureOperation.stopping ? "disconnecting" : (azurePending ? "connecting" : azure.state)
   readonly property string activeProfile: azure.connected ? (azure.path ? azure.path.split("/").pop() : "VPN") : nmProfile
   readonly property string activeType: azure.connected ? "Azure OpenP2S" : (nmType ? profileTypeLabel(nmType) + " (NetworkManager)" : "")
   readonly property string activeUuid: azure.connected ? "" : nmUuid
   readonly property string tunnelIp: azure.connected ? azure.address : nmTunnelIp
   readonly property string interfaceName: azure.connected ? azure.interface : nmInterface
-  readonly property string statusTitle: active ? "VPN Connected" : (azureDisplayState === "connecting" ? "VPN Connecting" : (azureDisplayState === "disconnecting" ? "VPN Disconnecting" : (azure.state === "unknown" ? "VPN Status Unknown" : "VPN Disconnected")))
-  readonly property string statusDescription: azure.connected && nmProfile ? "2 connections active" : (active ? "Connection active" : "")
+  readonly property string statusTitle: active ? "VPN Connected" : (azureDisplayState === "connecting" || (certificateProcess.running && !_nmAttemptCancelled) ? "VPN Connecting" : (azureDisplayState === "disconnecting" || (certificateProcess.running && _nmAttemptCancelled) ? "VPN Disconnecting" : (azure.state === "unknown" || !azureOperationKnown || !nmStateKnown ? "VPN Status Unknown" : "VPN Disconnected")))
+  readonly property int activeCount: (azure.connected ? 1 : 0) + (nmStateKnown ? _nmActiveUuids.length : 0)
+  readonly property string statusDescription: activeCount > 1 ? activeCount + " connections active" : (active ? "Connection active" : "")
   function azureRowStatus(path) {
-    if (azure.path === path) return azureOperation.stopping ? "disconnecting" : azure.state
+    if (azure.path === path) return azureOperation.stopping ? "disconnecting" : (!azureOperationKnown && azure.state === "disconnected" ? "unknown" : azure.state)
     if (azureOperation.path === path && (azureOperation.running || azureOperation.stopping) && !azure.connected) return azureDisplayState
-    return azure.state === "unknown" || (["connected", "reconnecting", "disconnecting", "stale"].indexOf(azure.state) !== -1 && !azure.path) ? "unknown" : "disconnected"
+    return !azureOperationKnown || azure.state === "unknown" || (["connected", "reconnecting", "disconnecting", "stale"].indexOf(azure.state) !== -1 && !azure.path) ? "unknown" : "disconnected"
   }
   function pollAzure() {
     if (!azureProcess.running) azureProcess.running = true
@@ -65,14 +84,15 @@ Item {
       try {
         var result = JSON.parse(azureOutput.text)
         root.azure = result
-        root.azureOperation = result.operation || {running: false, stopping: false, error: ""}
+        root.azureOperation = result.operation || {known: false, running: null, stopping: null, error: ""}
         if (root.azureOperation.error) {
           root.lastError = root.azureOperation.error
           root.lastMessage = ""
+          root.pendingAction = ""
         } else root.clearResolvedMessage()
       } catch (e) {
         root.azure = {state: "unknown", connected: false, path: "", interface: "", address: ""}
-        root.azureOperation = {running: false, stopping: false, error: ""}
+        root.azureOperation = {known: false, running: null, stopping: null, error: ""}
       }
     }
   }
@@ -80,7 +100,7 @@ Item {
   property string pendingAction: ""
   function clearResolvedMessage() {
     if ((pendingAction === "launch" && azure.connected) ||
-        (pendingAction === "disconnect" && azure.state === "disconnected" && !azureOperation.running && !azureOperation.stopping)) {
+        (pendingAction === "disconnect" && azure.state === "disconnected" && azureOperationKnown && !azureOperation.running && !azureOperation.stopping)) {
       lastMessage = ""
       pendingAction = ""
     }
@@ -99,7 +119,7 @@ Item {
 
   function profileAction(action, path) {
     if (importProcess.running || actionRunning) return
-    if (action === "launch" && (azureOperation.running || azureOperation.stopping || azure.state !== "disconnected")) return
+    if (action === "launch" && (!azureOperationKnown || azureOperation.running || azureOperation.stopping || azure.state !== "disconnected")) return
     if (action === "launch" || action === "disconnect") {
       lastError = ""
       pendingAction = action
@@ -118,21 +138,52 @@ Item {
     onExited: function(exitCode) {
       try {
         var result = JSON.parse(importOutput.text)
-        if (result.cancelled) return
+        if (result.cancelled) { root.pendingAction = ""; root.lastMessage = ""; return }
         if (result.azure !== undefined) root.azureProfiles = result.azure
-        if (result.error) { root.lastError = result.error; root.lastMessage = "" }
+        if (result.error || exitCode !== 0) { root.lastError = result.error || "Profile helper failed."; root.lastMessage = ""; root.pendingAction = "" }
         else if (result.message) {
           root.lastError = ""
           root.lastMessage = result.message
           root.clearResolvedMessage()
           root.refresh()
         }
-      } catch (e) { root.lastError = "Profile helper failed. Check /usr/bin/python3 and profiles.py." }
+      } catch (e) {
+        root.lastError = "Profile helper failed. Check /usr/bin/python3 and profiles.py."
+        root.lastMessage = ""
+        root.pendingAction = ""
+      }
     }
   }
   property string nmProfile: ""
   property string nmType: ""
   property string nmUuid: ""
+  property var _nmActiveUuids: []
+  property string _nmAttemptUuid: ""
+  property bool _nmAttemptWasInactive: false
+  property bool _nmAttemptCancelled: false
+  property string _nmAttemptError: ""
+  function nmRowStatus(uuid) {
+    if (certificateProcess.running && _nmAttemptUuid === uuid) return _nmAttemptCancelled ? "disconnecting" : "connecting"
+    if (!nmStateKnown) return "unknown"
+    return _nmActiveUuids.indexOf(uuid) !== -1 ? "connected" : "disconnected"
+  }
+  property bool nmStateKnown: false
+  function invalidateNmState() {
+    nmStateKnown = false
+    _nmActiveUuids = []
+    nmUuid = ""
+    nmProfile = ""
+    nmType = ""
+    nmTunnelIp = ""
+    nmInterface = ""
+  }
+  function clearConfirmedNmError() {
+    if (_nmAttemptWasInactive && !_nmAttemptCancelled && nmStateKnown && _nmActiveUuids.indexOf(_nmAttemptUuid) !== -1 &&
+        _nmAttemptError && lastError === _nmAttemptError) {
+      lastError = ""
+      _nmAttemptError = ""
+    }
+  }
 
   property string publicIp: ""
   property string nmTunnelIp: ""
@@ -148,7 +199,7 @@ Item {
   property string _ipOutput: ""
   property string _actionOutput: ""
 
-  readonly property bool active: azure.connected || nmProfile !== ""
+  readonly property bool active: azure.connected || (nmStateKnown && nmUuid !== "")
   readonly property int refreshIntervalSec: intSetting(
     "refreshIntervalSec",
     10,
@@ -232,28 +283,42 @@ Item {
     activeProcess.running = true
   }
 
-  function connectProfile(name) {
-    if (actionRunning || importProcess.running)
+  function connectProfile(uuid) {
+    if (actionRunning || importProcess.running || !nmStateKnown || !profiles.some(function(p) { return p.uuid === uuid }))
       return
 
     lastError = ""
     actionRunning = true
     _actionOutput = ""
 
-    actionProcess.command = [
-      "nmcli",
-      "--wait",
-      "45",
-      "connection",
-      "up",
-      "id",
-      name
-    ]
+    _nmAttemptUuid = uuid
+    _nmAttemptWasInactive = _nmActiveUuids.indexOf(uuid) === -1
+    _nmAttemptCancelled = false
+    _nmAttemptError = ""
+    certificateProcess.command = ["/usr/bin/python3", decodeURIComponent(Qt.resolvedUrl("nm-secret.py").toString().replace(/^file:\/\//, "")), uuid]
+    certificateProcess.running = true
+  }
 
+  function deleteProfile(uuid) {
+    if (actionRunning || importProcess.running || !nmStateKnown || !profiles.some(function(p) { return p.uuid === uuid })) return
+    lastError = ""
+    actionRunning = true
+    _actionOutput = ""
+    actionProcess.command = ["/usr/bin/python3", decodeURIComponent(Qt.resolvedUrl("profiles.py").toString().replace(/^file:\/\//, "")), "delete-nm", uuid]
     actionProcess.running = true
   }
 
+  function canRemoveAzure(path) {
+    return azureProfiles.indexOf(path) !== -1 && !actionRunning && !importProcess.running &&
+      azure.state === "disconnected" && azureOperationKnown && !azureOperation.running && !azureOperation.stopping
+  }
+
+  function removeAzure(path) {
+    if (canRemoveAzure(path)) profileAction("remove", path)
+  }
+
   function disconnectActive() {
+    if (certificateProcess.running) { cancelAuth(); return }
     if (azure.connected || azureOperation.running || azureOperation.stopping || ["reconnecting", "disconnecting", "stale"].indexOf(azure.state) !== -1) {
       profileAction("disconnect")
       return
@@ -261,8 +326,10 @@ Item {
     disconnectNm()
   }
 
-  function disconnectNm() {
-    if (actionRunning || nmProfile === "")
+  function disconnectNm(uuid) {
+    if (uuid === undefined) uuid = certificateProcess.running ? _nmAttemptUuid : nmUuid
+    if (certificateProcess.running && uuid === _nmAttemptUuid) { cancelAuth(); return }
+    if (actionRunning || importProcess.running || !nmStateKnown || _nmActiveUuids.indexOf(uuid) === -1)
       return
 
     lastError = ""
@@ -275,27 +342,28 @@ Item {
       "30",
       "connection",
       "down",
-      "id",
-      nmProfile
+      "uuid",
+      uuid
     ]
 
     actionProcess.running = true
   }
 
-  function toggleProfile(name) {
-    if (actionRunning || importProcess.running)
+  function toggleProfile(uuid) {
+    if (certificateProcess.running && uuid === _nmAttemptUuid) { cancelAuth(); return }
+    if (actionRunning || importProcess.running || !nmStateKnown || !profiles.some(function(p) { return p.uuid === uuid }))
       return
 
-    if (nmProfile === name) {
-      disconnectNm()
+    if (_nmActiveUuids.indexOf(uuid) !== -1) {
+      disconnectNm(uuid)
       return
     }
 
-    if (nmProfile !== "") {
+    if (nmUuid !== "") {
       actionRunning = true
       lastError = ""
 
-      switchProcess.target = name
+      switchProcess.target = uuid
 
       switchProcess.command = [
         "nmcli",
@@ -303,15 +371,15 @@ Item {
         "30",
         "connection",
         "down",
-        "id",
-        nmProfile
+        "uuid",
+        nmUuid
       ]
 
       switchProcess.running = true
       return
     }
 
-    connectProfile(name)
+    connectProfile(uuid)
   }
 
   function lookupPublicIp() {
@@ -333,7 +401,7 @@ Item {
   }
 
   function loadActiveDetails() {
-    if (nmProfile === "") {
+    if (nmUuid === "") {
       nmTunnelIp = ""
       nmInterface = ""
       return
@@ -343,15 +411,8 @@ Item {
       return
 
     _detailsOutput = ""
-
-    detailsProcess.command = [
-      "nmcli",
-      "-t",
-      "connection",
-      "show",
-      "--active",
-      nmProfile
-    ]
+    detailsProcess.target = nmUuid
+    detailsProcess.command = ["/usr/bin/python3", decodeURIComponent(Qt.resolvedUrl("profiles.py").toString().replace(/^file:\/\//, "")), "details-nm", nmUuid]
 
     detailsProcess.running = true
   }
@@ -406,6 +467,10 @@ Item {
   function parseActive(raw) {
     var lines = String(raw || "").split(/\r?\n/)
 
+    var previousUuid = nmUuid
+    nmStateKnown = true
+    _nmActiveUuids = parseProfiles(raw).map(function(p) { return p.uuid })
+    if (_nmAttemptUuid && _nmActiveUuids.indexOf(_nmAttemptUuid) === -1) _nmAttemptWasInactive = true
     nmProfile = ""
     nmUuid = ""
     nmType = ""
@@ -431,6 +496,8 @@ Item {
       nmProfile = parts.slice(0, parts.length - 2).join(":")
       break
     }
+    if (previousUuid !== nmUuid) { nmTunnelIp = ""; nmInterface = "" }
+    clearConfirmedNmError()
   }
 
   Process {
@@ -485,6 +552,7 @@ Item {
         root.loadActiveDetails()
         root.lookupPublicIp()
       } else {
+        root.invalidateNmState()
         root.lastError =
           String(activeStderr.text || "").trim()
           || "Could not read active VPN state"
@@ -496,6 +564,7 @@ Item {
 
   Process {
     id: detailsProcess
+    property string target: ""
 
     stdout: StdioCollector {
       id: detailsStdout
@@ -509,35 +578,19 @@ Item {
     }
 
     onExited: function(exitCode) {
+      if (target !== root.nmUuid) { root.loadActiveDetails(); return }
       if (exitCode !== 0) {
         root.nmTunnelIp = ""
         root.nmInterface = ""
         return
       }
 
-      var raw = String(
-        detailsStdout.text || root._detailsOutput || ""
-      )
-
-      var lines = raw.split(/\r?\n/)
-
-      root.nmTunnelIp = ""
-      root.nmInterface = ""
-
-      for (var i = 0; i < lines.length; i++) {
-        var line = lines[i]
-
-        if (line.indexOf("IP4.ADDRESS[1]:") === 0) {
-          root.nmTunnelIp =
-            line.substring("IP4.ADDRESS[1]:".length)
-                .split("/")[0]
-        }
-
-        if (line.indexOf("GENERAL.DEVICES:") === 0) {
-          root.nmInterface =
-            line.substring("GENERAL.DEVICES:".length)
-        }
-      }
+      try {
+        var result = JSON.parse(String(detailsStdout.text || root._detailsOutput || ""))
+        if (result.uuid !== root.nmUuid) return
+        root.nmTunnelIp = result.address || ""
+        root.nmInterface = result.interface || ""
+      } catch (e) { root.nmTunnelIp = ""; root.nmInterface = "" }
     }
   }
 
@@ -560,6 +613,30 @@ Item {
         root.publicIp =
           String(publicIpStdout.text || root._ipOutput || "").trim()
       }
+    }
+  }
+
+  Process {
+    id: certificateProcess
+    stdinEnabled: true
+    stdout: SplitParser {
+      onRead: function(data) {
+        var match = /^(REQUEST|DONE) ([0-9a-f]{32})$/.exec(data)
+        if (!match) return
+        if (match[1] === "REQUEST") root.certificateRequest = match[2]
+        else if (root.certificateRequest === match[2]) root.certificateRequest = ""
+      }
+    }
+    onExited: function(exitCode) {
+      root.certificateRequest = ""
+      root.actionRunning = false
+      root._nmAttemptError = exitCode === 0 ? "" : exitCode === 2
+        ? "VPN activation timed out. This does not establish a password failure."
+        : exitCode === 3 ? "Unsupported VPN authentication prompt or backend response."
+        : "VPN activation failed or was cancelled. Check NetworkManager diagnostics."
+      if (root._nmAttemptError && !root.lastError) root.lastError = root._nmAttemptError
+      root.clearConfirmedNmError()
+      refreshDelay.restart()
     }
   }
 
