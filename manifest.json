@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "airzy.vpn",
   "name": "TunnelHub",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Airzy",
   "license": "MIT",
   "description": "TunnelHub VPN profile and connection manager for Omarchy.",
