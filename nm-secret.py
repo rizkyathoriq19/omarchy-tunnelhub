@@ -56,16 +56,21 @@ def run(profile, command='nmcli', timeout=90):
                         return {0: 0, 3: 2}.get(child.wait(), 1)
                     output.extend(chunk)
                     chunk = b''
-                    # ponytail: only this native secret type; reject other prompts,
-                    # add explicit mappings only when another secret is requested.
-                    while b'\n' in output:
-                        _, _, rest = output.partition(b'\n')
-                        output[:] = rest
-                    if output == b'Certificate password (vpn.secrets.cert-pass): ':
+                    # OpenVPN cert-pass and SSTP tls-user-key-secret share the
+                    # masked certificate-password field. nmcli --ask renders
+                    # "<Label> (vpn.secrets.<key>): "; under LC_ALL=C the SSTP
+                    # auth dialog labels tls-user-key-secret "Certificate
+                    # password:" (GNOME/network-manager-sstp auth-dialog/main.c,
+                    # NM_SSTP_KEY_TLS_USER_KEY_SECRET). No other prompt is
+                    # answered; add explicit mappings only when another native
+                    # secret is requested and its bytes are verified.
+                    prompt = bytes(output)
+                    if prompt in (b'Certificate password (vpn.secrets.cert-pass): ',
+                                  b'Certificate password: (vpn.secrets.tls-user-key-secret): '):
                         if pending:
                             return 1
                         output.clear()
-                        if not file_attempted:
+                        if not file_attempted and prompt.endswith(b'cert-pass): '):
                             file_attempted = True
                             value = ovpn_source.password(profile)
                             if value is not None:
