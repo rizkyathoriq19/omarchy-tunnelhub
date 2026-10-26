@@ -310,7 +310,8 @@ Item {
 
   function canRemoveAzure(path) {
     return azureProfiles.indexOf(path) !== -1 && !actionRunning && !importProcess.running &&
-      azure.state === "disconnected" && azureOperationKnown && !azureOperation.running && !azureOperation.stopping
+      !azure.connected && (azure.state === "disconnected" || azure.state === "unknown") &&
+      azureOperationKnown && !azureOperation.running && !azureOperation.stopping
   }
 
   function removeAzure(path) {

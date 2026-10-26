@@ -75,7 +75,13 @@ def remove(path):
     if path not in paths:
         raise ValueError("Azure path is not registered.")
     operation = operation_status()
-    if not operation.get("known", False) or operation["running"] or operation["stopping"] or status()["state"] != "disconnected":
+    current = status()
+    if not operation.get("known", False) or operation["running"] or operation["stopping"]:
+        raise ValueError("Disconnect VPN and confirm status before removing a profile.")
+    # Removal only unregisters the path; it never touches a running tunnel.
+    # Unknown status (e.g. missing openp2s backend) with an idle unit must not
+    # lock the entry forever, but a live or transitioning session still blocks.
+    if current.get("connected") or current.get("state") not in ("disconnected", "unknown"):
         raise ValueError("Disconnect VPN and confirm status before removing a profile.")
     # Remove only the registry entry; source XML and certificates are untouched.
     paths = [p for p in paths if p != path]

@@ -56,17 +56,26 @@ def run(profile, command='nmcli', timeout=90):
                         return {0: 0, 3: 2}.get(child.wait(), 1)
                     output.extend(chunk)
                     chunk = b''
+                    while b'\n' in output:
+                        _, _, rest = output.partition(b'\n')
+                        output[:] = rest
                     # OpenVPN cert-pass and SSTP tls-user-key-secret share the
                     # masked certificate-password field. nmcli --ask renders
                     # "<Label> (vpn.secrets.<key>): "; under LC_ALL=C the SSTP
                     # auth dialog labels tls-user-key-secret "Certificate
                     # password:" (GNOME/network-manager-sstp auth-dialog/main.c,
-                    # NM_SSTP_KEY_TLS_USER_KEY_SECRET). No other prompt is
+                    # NM_SSTP_KEY_TLS_USER_KEY_SECRET). Pipe reads can split a
+                    # prompt mid-line, and the SSTP label itself contains ": ",
+                    # so a buffer that is only a strict prefix of a known
+                    # prompt waits for the rest instead of tripping the
+                    # fail-closed arm. Waiting stays bounded by the child poll
+                    # below and the helper deadline. No other prompt is
                     # answered; add explicit mappings only when another native
                     # secret is requested and its bytes are verified.
+                    prompts = (b'Certificate password (vpn.secrets.cert-pass): ',
+                               b'Certificate password: (vpn.secrets.tls-user-key-secret): ')
                     prompt = bytes(output)
-                    if prompt in (b'Certificate password (vpn.secrets.cert-pass): ',
-                                  b'Certificate password: (vpn.secrets.tls-user-key-secret): '):
+                    if prompt in prompts:
                         if pending:
                             return 1
                         output.clear()
@@ -82,7 +91,11 @@ def run(profile, command='nmcli', timeout=90):
                                 continue
                         pending = secrets.token_hex(16)
                         os.write(sys.stdout.fileno(), ('REQUEST ' + pending + '\n').encode())
-                    elif output.endswith(b': ') or len(output) > 8192:
+                    elif len(output) > 8192:
+                        return 3
+                    elif any(len(known) > len(prompt) and known.startswith(prompt) for known in prompts):
+                        pass  # Partial prompt; wait for more input.
+                    elif output.endswith(b': '):
                         return 3
                 else:
                     if not chunk:
