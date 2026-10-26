@@ -52,6 +52,7 @@ Panel {
     })
   } else {
     permissionField.text = ""
+    vpn.lastError = ""
     vpn.cancelAuth()
   }
 
