@@ -154,6 +154,27 @@ Item {
       }
     }
   }
+
+  // Re-reads the Azure registry without touching NM state. Runs on every
+  // panel open/refresh so entries removed externally (or before removal was
+  // allowed) cannot linger as ghost rows; the Repeater renders azureProfiles
+  // verbatim, so a stale list is a visible bug.
+  function reloadAzureRegistry() {
+    if (registryProcess.running || importProcess.running)
+      return
+    registryProcess.running = true
+  }
+  Process {
+    id: registryProcess
+    command: ["/usr/bin/python3", decodeURIComponent(Qt.resolvedUrl("profiles.py").toString().replace(/^file:\/\//, "")), "list"]
+    stdout: StdioCollector { id: registryOutput; waitForEnd: true }
+    onExited: function(exitCode) {
+      try {
+        var result = JSON.parse(registryOutput.text)
+        if (result.azure !== undefined) root.azureProfiles = result.azure
+      } catch (e) { /* keep last known list; next refresh retries */ }
+    }
+  }
   property string nmProfile: ""
   property string nmType: ""
   property string nmUuid: ""
@@ -237,6 +258,7 @@ Item {
 
   function refresh() {
     pollAzure()
+    reloadAzureRegistry()
     if (refreshing)
       return
 
