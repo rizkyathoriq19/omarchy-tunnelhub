@@ -37,17 +37,16 @@ maintainer decision; local tests do not establish marketplace approval.
 Source: <https://github.com/omacom/omarchy-plugin-marketplace/blob/main/SUBMISSION.md>.
 
 
-TunnelHub (`airzy.vpn`) manages existing NetworkManager VPN and WireGuard
-profiles through `nmcli`. It requires NetworkManager, the relevant VPN backend,
-and `curl` for the public-IP display.
+TunnelHub (`airzy.vpn`) manages NetworkManager VPN / WireGuard profiles, Azure
+Point-to-Site connections (OpenP2S), and FortiClient SSL-VPN profiles.
 
-- Left click: open panel; right click: disconnect the shown VPN (Azure first when both are active).
+- Left click: open panel; right click: disconnect the shown VPN.
 - Middle click or `R`: refresh.
-- Arrow keys: select a profile; Enter: connect/disconnect NetworkManager or connect/disconnect imported XML profiles.
-- `I` or **Import profile…**: choose `.ovpn`, `.conf` or `.xml`.
-- `D`: disconnect; Escape: close.
-- Switching profiles disconnects the current NetworkManager VPN first.
-
+- Arrow keys: select a profile; Enter: connect/disconnect selected profile.
+- `I` or **Import…**: import `.ovpn`, `.conf`, `.sconf`, or `.xml` (Auto-detects NetworkManager, Azure, or FortiClient).
+- `F` or **New Forti…**: add a FortiClient profile via interactive form.
+- `D`: disconnect selected profile; Escape: close panel.
+- Switching profiles disconnects the active profile before switching.
 ## NetworkManager certificate passwords
 
 The native OpenVPN importer does not preserve an `.ovpn` `askpass FILE`

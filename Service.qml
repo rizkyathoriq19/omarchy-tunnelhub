@@ -10,9 +10,19 @@ Item {
   // A separate stdin pipe carries responses; ordinary status never contains secrets.
   property string permissionRequest: ""
   property string certificateRequest: ""
-  readonly property string authRequest: certificateRequest || permissionRequest
+  property string fortiRequest: ""
+  readonly property string authRequest: fortiRequest || certificateRequest || permissionRequest
   readonly property bool certificatePrompt: certificateRequest !== ""
+  readonly property bool fortiPrompt: fortiRequest !== ""
   function respondAuth(value) {
+    if (fortiRequest) {
+      var name = fortiRequest
+      fortiRequest = ""
+      if (value && value.length > 0) {
+        profileAction("connect-forti-pass", name, value)
+      }
+      return
+    }
     if (!certificateRequest) { respondPermission(value); return }
     var ident = certificateRequest
     certificateRequest = ""
@@ -22,6 +32,7 @@ Item {
     else { _nmAttemptCancelled = true; certificateProcess.write(ident + "\n") }
   }
   function cancelAuth() {
+    fortiRequest = ""
     if (certificateProcess.running) { _nmAttemptCancelled = true; certificateProcess.write("CANCEL\n") }
     certificateRequest = ""
     cancelPermission()
@@ -55,19 +66,26 @@ Item {
 
   property var profiles: []
   property var azureProfiles: []
+  property var fortiProfiles: []
+  property var fortiSaved: ({})
   property var azure: ({state: "unknown", connected: false, path: "", interface: "", address: ""})
+  property var forti: ({installed: false, state: "disconnected", connected: false, profile: "", interface: "", address: ""})
   property var azureOperation: ({known: false, running: null, stopping: null, error: ""})
   readonly property bool azureOperationKnown: azureOperation.known === true && typeof azureOperation.running === "boolean" && typeof azureOperation.stopping === "boolean"
   readonly property bool azurePending: azureOperation.running === true && !azure.connected
   readonly property string azureDisplayState: azureOperation.stopping ? "disconnecting" : (azurePending ? "connecting" : azure.state)
-  readonly property string activeProfile: azure.connected ? (azure.path ? azure.path.split("/").pop() : "VPN") : nmProfile
-  readonly property string activeType: azure.connected ? "Azure OpenP2S" : (nmType ? profileTypeLabel(nmType) + " (NetworkManager)" : "")
-  readonly property string activeUuid: azure.connected ? "" : nmUuid
-  readonly property string tunnelIp: azure.connected ? azure.address : nmTunnelIp
-  readonly property string interfaceName: azure.connected ? azure.interface : nmInterface
-  readonly property string statusTitle: active ? "VPN Connected" : (azureDisplayState === "connecting" || (certificateProcess.running && !_nmAttemptCancelled) ? "VPN Connecting" : (azureDisplayState === "disconnecting" || (certificateProcess.running && _nmAttemptCancelled) ? "VPN Disconnecting" : (azure.state === "unknown" || !azureOperationKnown || !nmStateKnown ? "VPN Status Unknown" : "VPN Disconnected")))
-  readonly property int activeCount: (azure.connected ? 1 : 0) + (nmStateKnown ? _nmActiveUuids.length : 0)
+  readonly property string activeProfile: azure.connected ? (azure.path ? azure.path.split("/").pop() : "VPN") : (forti.connected ? forti.profile : nmProfile)
+  readonly property string activeType: azure.connected ? "Azure OpenP2S" : (forti.connected ? "FortiClient SSL-VPN" : (nmType ? profileTypeLabel(nmType) + " (NetworkManager)" : ""))
+  readonly property string activeUuid: azure.connected ? "" : (forti.connected ? "" : nmUuid)
+  readonly property string tunnelIp: azure.connected ? azure.address : (forti.connected ? forti.address : nmTunnelIp)
+  readonly property string interfaceName: azure.connected ? azure.interface : (forti.connected ? forti.interface : nmInterface)
+  readonly property string statusTitle: active ? "VPN Connected" : (azureDisplayState === "connecting" || forti.state === "connecting" || (certificateProcess.running && !_nmAttemptCancelled) ? "VPN Connecting" : (azureDisplayState === "disconnecting" || (certificateProcess.running && _nmAttemptCancelled) ? "VPN Disconnecting" : (azure.state === "unknown" || !azureOperationKnown || !nmStateKnown ? "VPN Status Unknown" : "VPN Disconnected")))
+  readonly property int activeCount: (azure.connected ? 1 : 0) + (forti.connected ? 1 : 0) + (nmStateKnown ? _nmActiveUuids.length : 0)
   readonly property string statusDescription: activeCount > 1 ? activeCount + " connections active" : (active ? "Connection active" : "")
+  function fortiRowStatus(name) {
+    if (forti.profile === name) return forti.state
+    return "disconnected"
+  }
   function azureRowStatus(path) {
     if (azure.path === path) return azureOperation.stopping ? "disconnecting" : (!azureOperationKnown && azure.state === "disconnected" ? "unknown" : azure.state)
     if (azureOperation.path === path && (azureOperation.running || azureOperation.stopping) && !azure.connected) return azureDisplayState
@@ -83,13 +101,29 @@ Item {
     onExited: {
       try {
         var result = JSON.parse(azureOutput.text)
-        root.azure = result
-        root.azureOperation = result.operation || {known: false, running: null, stopping: null, error: ""}
+        if (result.forti !== undefined) {
+          root.forti = result.forti
+          if (result.forti.saved !== undefined) {
+            root.fortiSaved = result.forti.saved
+          }
+          if (result.forti.passwordRequired) {
+            root.fortiRequest = result.forti.passwordRequired
+            root.lastError = ""
+            root.lastMessage = ""
+            root.pendingAction = ""
+          } else if (result.forti.error) {
+            root.lastError = result.forti.error
+            root.lastMessage = ""
+            root.pendingAction = ""
+          }
+        }
         if (root.azureOperation.error) {
           root.lastError = root.azureOperation.error
           root.lastMessage = ""
           root.pendingAction = ""
-        } else root.clearResolvedMessage()
+        } else if (!result.forti || (!result.forti.error && !result.forti.passwordRequired)) {
+          root.clearResolvedMessage()
+        }
       } catch (e) {
         root.azure = {state: "unknown", connected: false, path: "", interface: "", address: ""}
         root.azureOperation = {known: false, running: null, stopping: null, error: ""}
@@ -100,6 +134,8 @@ Item {
   property string pendingAction: ""
   function clearResolvedMessage() {
     if ((pendingAction === "launch" && azure.connected) ||
+        (pendingAction === "connect-forti" && forti.connected) ||
+        (pendingAction === "disconnect-forti" && !forti.connected) ||
         (pendingAction === "disconnect" && azure.state === "disconnected" && azureOperationKnown && !azureOperation.running && !azureOperation.stopping)) {
       lastMessage = ""
       pendingAction = ""
@@ -111,35 +147,63 @@ Item {
     else if (azureOperation.path === path && azureOperation.running) profileAction("disconnect")
     else profileAction("launch", path)
   }
+  function toggleForti(name) {
+    if (forti.connected && forti.profile === name) {
+      profileAction("disconnect-forti")
+    } else if (fortiSaved[name] !== true) {
+      root.fortiRequest = name
+      lastMessage = ""
+      lastError = ""
+    } else {
+      profileAction("connect-forti", name)
+    }
+  }
+  function deleteForti(name) {
+    profileAction("delete-forti", name)
+  }
+  function disconnectForti() {
+    profileAction("disconnect-forti")
+  }
   function rowAction(state) {
     return ["connected", "connecting", "reconnecting"].indexOf(state) !== -1 ? "Disconnect" : "Connect"
   }
   Timer { interval: 4000; running: root.lastMessage !== "" && root.pendingAction === ""; onTriggered: root.lastMessage = "" }
   readonly property bool importing: importProcess.running
 
-  function profileAction(action, path) {
+  function profileAction(action, path, input) {
     if (importProcess.running || actionRunning) return
     if (action === "launch" && (!azureOperationKnown || azureOperation.running || azureOperation.stopping || azure.state !== "disconnected")) return
-    if (action === "launch" || action === "disconnect") {
+    if (action === "launch" || action === "disconnect" || action === "connect-forti" || action === "connect-forti-pass" || action === "disconnect-forti") {
       lastError = ""
       pendingAction = action
-      lastMessage = action === "launch" ? "Connecting…" : "Disconnecting…"
+      lastMessage = (action === "launch" || action === "connect-forti" || action === "connect-forti-pass") ? "Connecting…" : "Disconnecting…"
+    }
+    if (input !== undefined && input !== "") {
+      importProcess.environment = { "AIRZY_FORTI_PASS": input }
+    } else {
+      importProcess.environment = {}
     }
     importProcess.command = ["/usr/bin/python3", decodeURIComponent(Qt.resolvedUrl("profiles.py").toString().replace(/^file:\/\//, "")), action]
     if (path !== undefined) importProcess.command = importProcess.command.concat([path])
     importProcess.running = true
+    if (input !== undefined) {
+      importProcess.write(input + "\n")
+    }
   }
 
   Component.onCompleted: profileAction("list")
 
   Process {
     id: importProcess
+    stdinEnabled: true
     stdout: StdioCollector { id: importOutput; waitForEnd: true }
     onExited: function(exitCode) {
       try {
         var result = JSON.parse(importOutput.text)
         if (result.cancelled) { root.pendingAction = ""; root.lastMessage = ""; return }
         if (result.azure !== undefined) root.azureProfiles = result.azure
+        if (result.forti !== undefined) root.fortiProfiles = result.forti
+        if (result.fortiSaved !== undefined) root.fortiSaved = result.fortiSaved
         if (result.error || exitCode !== 0) { root.lastError = result.error || "Profile helper failed."; root.lastMessage = ""; root.pendingAction = "" }
         else if (result.message) {
           root.lastError = ""
@@ -321,6 +385,10 @@ Item {
     if (certificateProcess.running) { cancelAuth(); return }
     if (azure.connected || azureOperation.running || azureOperation.stopping || ["reconnecting", "disconnecting", "stale"].indexOf(azure.state) !== -1) {
       profileAction("disconnect")
+      return
+    }
+    if (forti.connected) {
+      profileAction("disconnect-forti")
       return
     }
     disconnectNm()

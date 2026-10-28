@@ -25,6 +25,8 @@ def connection_settings():
     experimental = settings.get("azureExperimentalCompat", False)
     if not isinstance(ca, str) or not isinstance(experimental, bool):
         raise ValueError("Invalid Azure settings: CA path must be a string and experimental compatibility a boolean.")
+    if ca.startswith("~"):
+        ca = str(Path(ca).expanduser())
     if not ca or not ca.startswith("/") or any(c in ca for c in "\x00\r\n"):
         raise ValueError("Configure azureCaPath with an absolute trusted CA certificate path before connecting.")
     if not Path(ca).is_file():
@@ -148,16 +150,383 @@ def nm_details(profile):
     return {"uuid": profile, "address": address, "interface": matches.pop() if len(matches) == 1 else ""}
 
 
+def parse_forti_xml(path):
+    import xml.etree.ElementTree as ET
+    try:
+        tree = ET.parse(path)
+        root = tree.getroot()
+        if root.tag not in ("forticlient_configuration", "fortivpn_configuration") and not root.find(".//connection"):
+            return []
+        conns = []
+        for conn in root.iter("connection"):
+            name = conn.findtext("name") or ""
+            server = conn.findtext("server") or ""
+            user = conn.findtext("username") or ""
+            host = server
+            port = "443"
+            if ":" in server:
+                host, port = server.split(":", 1)
+            if name and host:
+                conns.append({"name": name, "host": host, "port": port, "username": user})
+        return conns
+    except Exception:
+        return []
+
+
+def parse_forti_conf(path):
+    try:
+        lines = Path(path).read_text(errors="ignore").splitlines()
+        host = ""
+        port = "443"
+        username = ""
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith(";"):
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                k = k.strip().lower()
+                v = v.strip().strip('"').strip("'")
+                if k in ("host", "gateway", "server", "remote"):
+                    if ":" in v:
+                        host, port = v.split(":", 1)
+                    else:
+                        host = v
+                elif k == "port":
+                    port = v
+                elif k in ("user", "username"):
+                    username = v
+        if host:
+            name = Path(path).stem
+            return {"name": name, "host": host, "port": port, "username": username}
+    except Exception:
+        pass
+    return None
+
+
+def forti_installed():
+    return shutil.which("forticlient") is not None
+
+
+def forti_list():
+    if not forti_installed():
+        return []
+    try:
+        res = subprocess.run(["forticlient", "vpn", "list"], capture_output=True, text=True, timeout=5)
+        if res.returncode != 0:
+            return []
+        lines = res.stdout.splitlines()
+        profiles = []
+        in_vpns = False
+        for line in lines:
+            stripped = line.strip()
+            if "Personal VPNs:" in line or "VPNs:" in line:
+                in_vpns = True
+                continue
+            if in_vpns and stripped and not stripped.endswith(":"):
+                profiles.append(stripped)
+        return profiles
+    except Exception:
+        return []
+
+
+FORTI_ERROR_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "airzy.vpn-forti-error.txt"
+
+
+def forti_status():
+    if not forti_installed():
+        return {"installed": False, "state": "not_installed", "connected": False, "profile": "", "interface": "", "address": "", "error": "", "passwordRequired": "", "saved": {}}
+    try:
+        res = subprocess.run(["forticlient", "vpn", "status"], capture_output=True, text=True, timeout=5)
+        lines = [l.strip() for l in res.stdout.splitlines()]
+        state = "disconnected"
+        connected = False
+        profile = ""
+        address = ""
+        for line in lines:
+            if line.startswith("Status:"):
+                st = line.split(":", 1)[1].strip().lower()
+                if "connected" in st:
+                    state = "connected"
+                    connected = True
+                elif "connecting" in st or "re-connecting" in st or "xauth" in st:
+                    state = "connecting"
+                elif "not running" in st or "disconnected" in st:
+                    state = "disconnected"
+                else:
+                    state = "unknown"
+            elif line.startswith("VPN name:"):
+                profile = line.split(":", 1)[1].strip()
+            elif line.startswith("IP:"):
+                address = line.split(":", 1)[1].strip()
+        interface = ""
+        if connected:
+            try:
+                ip_res = subprocess.run([require("ip"), "-j", "link", "show"], capture_output=True, text=True, timeout=3)
+                if ip_res.returncode == 0:
+                    links = json.loads(ip_res.stdout)
+                    for link in links:
+                        if link.get("ifname", "").startswith("fctvpn"):
+                            interface = link["ifname"]
+                            break
+            except Exception:
+                pass
+        error = ""
+        password_req = ""
+        if state == "connected":
+            try:
+                FORTI_ERROR_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+        elif FORTI_ERROR_FILE.exists():
+            try:
+                raw_err = FORTI_ERROR_FILE.read_text().strip()
+                if raw_err.startswith("PASSWORD_REQUIRED:"):
+                    password_req = raw_err.split(":", 1)[1].strip()
+                else:
+                    error = raw_err
+            except Exception:
+                pass
+        saved = {p: forti_has_password(p) for p in forti_list()}
+        return {
+            "installed": True,
+            "state": state,
+            "connected": connected,
+            "profile": profile,
+            "interface": interface,
+            "address": address,
+            "error": error,
+            "passwordRequired": password_req,
+            "saved": saved
+        }
+    except Exception:
+        return {"installed": True, "state": "unknown", "connected": False, "profile": "", "interface": "", "address": "", "error": "", "passwordRequired": "", "saved": {}}
+
+
+def forti_connect_pty(name, password):
+    import pty
+    import select
+    import time
+    master, slave = pty.openpty()
+    pid = os.fork()
+    if pid == 0:
+        os.close(master)
+        os.dup2(slave, 0)
+        os.dup2(slave, 1)
+        os.dup2(slave, 2)
+        os.close(slave)
+        os.execv("/usr/bin/forticlient", ["forticlient", "vpn", "connect", name, "-p", "-s"])
+    else:
+        os.close(slave)
+        buf = b""
+        state = 0
+        start = time.time()
+        connected = False
+        try:
+            while time.time() - start < 25:
+                r, _, _ = select.select([master], [], [], 0.5)
+                if not r:
+                    continue
+                try:
+                    chunk = os.read(master, 1024)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                if state == 0 and b"Password:" in buf:
+                    os.write(master, (password + "\n").encode())
+                    state = 1
+                elif state == 1 and b"Confirm (y/n)" in buf:
+                    os.write(master, b"y\n")
+                    state = 2
+                elif state >= 1 and (b"Status: Connected" in buf or b"Notification:" in buf or b"Status: Disconnected" in buf):
+                    if b"Status: Connected" in buf:
+                        connected = True
+                    time.sleep(0.5)
+                    try:
+                        buf += os.read(master, 1024)
+                    except Exception:
+                        pass
+                    break
+        finally:
+            try:
+                os.close(master)
+            except Exception:
+                pass
+            if not connected:
+                try:
+                    os.kill(pid, 9)
+                except Exception:
+                    pass
+            try:
+                os.waitpid(pid, 0)
+            except Exception:
+                pass
+        return buf.decode(errors="replace")
+
+def forti_has_password(name):
+    try:
+        res = subprocess.run(["forticlient", "vpn", "view", name], capture_output=True, text=True, timeout=5)
+        for line in res.stdout.splitlines():
+            if line.strip().startswith("Save Password:"):
+                return line.split(":", 1)[1].strip().lower() == "enabled"
+    except Exception:
+        pass
+    return False
+
+
+def forti_connect_pass_bg(name, password):
+    try:
+        pty_out = forti_connect_pty(name, password)
+        if "Status: Connected" in pty_out:
+            try:
+                FORTI_ERROR_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+        elif "Insufficient credential" in pty_out or "Login failed" in pty_out:
+            FORTI_ERROR_FILE.write_text("Password salah atau ditolak oleh server VPN.")
+        elif "Login canceled" in pty_out:
+            FORTI_ERROR_FILE.write_text("Koneksi dibatalkan oleh FortiClient.")
+        else:
+            for line in pty_out.splitlines():
+                if "Notification:" in line:
+                    FORTI_ERROR_FILE.write_text(line.strip())
+                    break
+    except Exception as err:
+        try:
+            FORTI_ERROR_FILE.write_text(str(err))
+        except Exception:
+            pass
+
+
+def forti_connect_with_password(name, password):
+    client = require("forticlient")
+    if name not in forti_list():
+        raise ValueError(f"FortiClient profile '{name}' is not registered.")
+    try:
+        FORTI_ERROR_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+    env = dict(os.environ, AIRZY_FORTI_PASS=password)
+    p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "bg-connect-forti-pass", name],
+                         stdin=subprocess.PIPE, start_new_session=True, env=env,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        p.stdin.write(password.encode() + b"\n")
+        p.stdin.close()
+    except Exception:
+        pass
+    return {"message": f"Connecting to FortiClient '{name}'…"}
+
+
+def forti_connect_bg(name):
+    client = require("forticlient")
+    try:
+        p = subprocess.Popen([client, "vpn", "connect", name],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        stdout, _ = p.communicate(input="y\n", timeout=10)
+        if "Insufficient credential" in stdout:
+            FORTI_ERROR_FILE.write_text(f"PASSWORD_REQUIRED:{name}")
+        elif "Login canceled" in stdout:
+            FORTI_ERROR_FILE.write_text("Koneksi dibatalkan oleh FortiClient.")
+        elif "Status: Connected" not in stdout:
+            for line in stdout.splitlines():
+                if "Notification:" in line:
+                    FORTI_ERROR_FILE.write_text(line.strip())
+                    break
+    except Exception as err:
+        try:
+            FORTI_ERROR_FILE.write_text(str(err))
+        except Exception:
+            pass
+def forti_connect(name):
+    client = require("forticlient")
+    if name not in forti_list():
+        raise ValueError(f"FortiClient profile '{name}' is not registered.")
+    try:
+        FORTI_ERROR_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "bg-connect-forti", name],
+                     start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    return {"message": f"Connecting to FortiClient '{name}'…"}
+
+def forti_disconnect():
+    client = require("forticlient")
+    try:
+        FORTI_ERROR_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+    res = subprocess.run([client, "vpn", "disconnect"], capture_output=True, text=True, timeout=10)
+    if res.returncode != 0:
+        raise ValueError("Failed to disconnect FortiClient.")
+    return {"message": "FortiClient disconnected."}
+
+def forti_delete(name):
+    client = require("forticlient")
+    res = subprocess.run([client, "vpn", "remove", name], capture_output=True, text=True, timeout=10)
+    if res.returncode != 0:
+        raise ValueError(f"Failed to remove FortiClient profile '{name}'.")
+    return {"message": f"FortiClient profile '{name}' removed.", "forti": forti_list()}
+
+
+def forti_create(name, host, port, username):
+    client = require("forticlient")
+    if name in forti_list():
+        subprocess.run([client, "vpn", "remove", name], capture_output=True, text=True, timeout=5)
+    p = subprocess.Popen([client, "vpn", "edit", name],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    inputs = f"{host}\n{port}\n2\n{username}\n3\n"
+    stdout, stderr = p.communicate(inputs, timeout=10)
+    if p.returncode != 0:
+        raise ValueError(f"Failed to create FortiClient profile '{name}'.")
+    return {"message": f"FortiClient profile '{name}' created.", "forti": forti_list()}
+
+
+def form_forti():
+    picker = subprocess.run([
+        require("zenity"), "--forms", "--title=Add FortiClient VPN Profile",
+        "--text=Enter FortiClient VPN Connection Details",
+        "--add-entry=Profile Name",
+        "--add-entry=Remote Gateway (Host/IP)",
+        "--add-entry=Port (Default: 443)",
+        "--add-entry=Username"
+    ], capture_output=True, text=True)
+    if picker.returncode == 1:
+        return {"cancelled": True}
+    if picker.returncode:
+        raise ValueError("Dialog failed. Check zenity.")
+    parts = picker.stdout.strip().split("|")
+    if len(parts) < 4:
+        raise ValueError("Incomplete profile details entered.")
+    name, host, port, username = [p.strip() for p in parts[:4]]
+    if not name or not host:
+        raise ValueError("Profile name and Remote Gateway are required.")
+    port = port or "443"
+    return forti_create(name, host, port, username)
+
+
 def import_path(path):
     if not path.startswith("/") or any(c in path for c in "\x00\r\n"):
         raise ValueError("Select an absolute file path without newlines.")
     suffix = Path(path).suffix.lower()
     if suffix == ".xml":
+        forti_conns = parse_forti_xml(path)
+        if forti_conns:
+            for c in forti_conns:
+                forti_create(c["name"], c["host"], c["port"], c["username"])
+            return {"forti": forti_list(), "message": "FortiClient profile(s) imported from XML."}
         # Path metadata only: no open, parse, copy, or validation of XML contents.
         return {"azure": register(path), "message": "Profile imported."}
+    if suffix in (".conf", ".sconf"):
+        forti_info = parse_forti_conf(path)
+        if forti_info:
+            forti_create(forti_info["name"], forti_info["host"], forti_info["port"], forti_info["username"])
+            return {"forti": forti_list(), "message": f"FortiClient profile '{forti_info['name']}' imported.", "forti": forti_list()}
     kind = {".ovpn": "openvpn", ".conf": "wireguard"}.get(suffix)
     if not kind:
-        raise ValueError("Supported files: OpenVPN .ovpn, WireGuard .conf, Azure .xml.")
+        raise ValueError("Supported files: OpenVPN .ovpn, WireGuard .conf, Azure .xml, FortiClient .conf/.xml.")
     env = dict(os.environ, LC_ALL="C")
     result = subprocess.run([require("nmcli"), "connection", "import", "type", kind, "file", path],
                             capture_output=True, text=True, timeout=30, env=env)
@@ -423,11 +792,37 @@ def disconnect():
 def main():
     action = sys.argv[1]
     if action == "status":
-        return dict(status(), operation=operation_status())
+        return dict(status(), operation=operation_status(), forti=forti_status())
     if action == "disconnect":
         return disconnect()
+    if action == "bg-connect-forti":
+        forti_connect_bg(sys.argv[2])
+        return {"done": True}
+    if action == "connect-forti":
+        return forti_connect(sys.argv[2])
+    if action == "disconnect-forti":
+        return forti_disconnect()
+    if action == "delete-forti":
+        return forti_delete(sys.argv[2])
+    if action == "form-forti":
+        return form_forti()
+    if action == "connect-forti-pass":
+        name = sys.argv[2]
+        password = os.environ.get("AIRZY_FORTI_PASS", "")
+        if not password and not sys.stdin.isatty():
+            password = sys.stdin.readline().rstrip("\r\n")
+        return forti_connect_with_password(name, password)
+    if action == "bg-connect-forti-pass":
+        name = sys.argv[2]
+        password = os.environ.get("AIRZY_FORTI_PASS", "")
+        if not password and not sys.stdin.isatty():
+            password = sys.stdin.readline().rstrip("\r\n")
+        forti_connect_pass_bg(name, password)
+        return {"done": True}
     if action == "list":
-        return {"azure": load()}
+        profiles = forti_list()
+        saved = {p: forti_has_password(p) for p in profiles}
+        return {"azure": load(), "forti": profiles, "fortiSaved": saved}
     if action == "details-nm":
         return nm_details(sys.argv[2])
     if action == "delete-nm":
@@ -438,7 +833,7 @@ def main():
         return launch(sys.argv[2])
     if action != "import":
         raise ValueError("Unknown action")
-    picker = subprocess.run([require("zenity"), "--file-selection", "--title=Import VPN profile", "--file-filter=VPN profiles | *.ovpn *.conf *.xml", "--file-filter=All files | *"], capture_output=True, text=True)
+    picker = subprocess.run([require("zenity"), "--file-selection", "--title=Import VPN profile", "--file-filter=VPN profiles | *.ovpn *.conf *.xml *.sconf", "--file-filter=FortiClient profiles | *.conf *.sconf *.xml", "--file-filter=All files | *"], capture_output=True, text=True)
     if picker.returncode == 1:
         return {"cancelled": True}
     if picker.returncode:

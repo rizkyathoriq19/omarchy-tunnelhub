@@ -114,20 +114,21 @@ Panel {
     }
   }
 
-  readonly property int profileCount: vpn.profiles.length + vpn.azureProfiles.length
+  readonly property int profileCount: vpn.profiles.length + vpn.azureProfiles.length + (vpn.fortiProfiles ? vpn.fortiProfiles.length : 0)
 
   function selectedProfile() {
-    if (profileIndex >= vpn.profiles.length)
-      return { type: "azure", path: vpn.azureProfiles[profileIndex - vpn.profiles.length] }
-    if (!vpn.profiles || root.profileCount === 0)
-      return null
+    if (profileIndex < vpn.profiles.length)
+      return vpn.profiles[profileIndex]
 
-    var index = Math.max(
-      0,
-      Math.min(profileIndex, vpn.profiles.length - 1)
-    )
+    var azureIndex = profileIndex - vpn.profiles.length
+    if (azureIndex < vpn.azureProfiles.length)
+      return { type: "azure", path: vpn.azureProfiles[azureIndex] }
 
-    return vpn.profiles[index]
+    var fortiIndex = azureIndex - vpn.azureProfiles.length
+    if (vpn.fortiProfiles && fortiIndex < vpn.fortiProfiles.length)
+      return { type: "forti", name: vpn.fortiProfiles[fortiIndex] }
+
+    return null
   }
 
   function moveCursor(dx, dy) {
@@ -147,7 +148,9 @@ Panel {
 
   function disconnectSelected() {
     var profile = selectedProfile()
-    if (profile && profile.uuid && ["connected", "connecting", "disconnecting"].indexOf(vpn.nmRowStatus(profile.uuid)) !== -1)
+    if (profile && profile.type === "forti")
+      vpn.disconnectForti()
+    else if (profile && profile.uuid && ["connected", "connecting", "disconnecting"].indexOf(vpn.nmRowStatus(profile.uuid)) !== -1)
       vpn.disconnectNm(profile.uuid)
     else vpn.disconnectActive()
   }
@@ -160,6 +163,8 @@ Panel {
 
     if (profile.type === "azure") {
       if (profile.path !== undefined) vpn.toggleAzure(profile.path)
+    } else if (profile.type === "forti") {
+      if (profile.name !== undefined) vpn.toggleForti(profile.name)
     } else vpn.toggleProfile(profile.uuid)
   }
 
@@ -284,6 +289,9 @@ Panel {
         else if (t === "i" || t === "I")
           vpn.profileAction("import")
 
+        else if (t === "f" || t === "F")
+          vpn.profileAction("form-forti")
+
         else if (t === "d" || t === "D")
           root.disconnectSelected()
       }
@@ -319,14 +327,14 @@ Panel {
             spacing: Style.space(8)
             Text {
               width: parent.width
-              text: vpn.certificatePrompt ? "VPN certificate password required" : "System permission required"
+              text: vpn.certificatePrompt ? "VPN certificate password required" : (vpn.fortiPrompt ? "FortiClient VPN password required" : "System permission required")
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
             }
             Text {
               width: parent.width
-              text: vpn.certificatePrompt ? "Enter the password that unlocks your VPN certificate/private key, not your system password. Cancel stops this connection attempt." : "Enter your system password for sudo. Cancel denies this request."
+              text: vpn.certificatePrompt ? "Enter the password that unlocks your VPN certificate/private key, not your system password. Cancel stops this connection attempt." : (vpn.fortiPrompt ? ("Enter password for FortiClient profile '" + vpn.fortiRequest + "'. It will be saved securely for future connections.") : "Enter your system password for sudo. Cancel denies this request.")
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -337,11 +345,11 @@ Panel {
               width: parent.width
               password: true
               maximumLength: 4092
-              placeholderText: vpn.certificatePrompt ? "Certificate password" : "System password"
+              placeholderText: vpn.certificatePrompt ? "Certificate password" : (vpn.fortiPrompt ? "VPN password" : "System password")
               foreground: root.foreground
               accent: root.accent
               inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
-              Accessible.name: vpn.certificatePrompt ? "VPN certificate password" : "System password for sudo"
+              Accessible.name: vpn.certificatePrompt ? "VPN certificate password" : (vpn.fortiPrompt ? "FortiClient VPN password" : "System password for sudo")
               function submit() {
                 var response = text
                 text = ""
@@ -359,7 +367,7 @@ Panel {
                 id: permissionSubmit
                 focusable: true
                 Accessible.role: Accessible.Button
-                Accessible.name: vpn.certificatePrompt ? "Submit certificate password" : "Submit system password"
+                Accessible.name: vpn.certificatePrompt ? "Submit certificate password" : (vpn.fortiPrompt ? "Submit FortiClient password" : "Submit system password")
                 Accessible.onPressAction: clicked()
                 text: "Submit"
                 enabled: permissionField.text.length > 0
@@ -799,15 +807,109 @@ Panel {
                   ToolTip.text: modelData.split("/").pop() + " · " + (vpn.azureRowStatus(modelData))
                 }
               }
+              Repeater {
+                model: vpn.fortiProfiles
+                delegate: Rectangle {
+                  required property string modelData
+                  required property int index
+                  width: profileColumn.width
+                  implicitHeight: fortiRow.implicitHeight + Style.space(12)
+                  radius: Style.space(4)
+                  color: vpn.forti.connected && vpn.forti.profile === modelData
+                    ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.18)
+                    : (root.cursorActive && root.profileIndex === vpn.profiles.length + vpn.azureProfiles.length + index
+                      ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08) : "transparent")
+                  enabled: !vpn.importing && !vpn.actionRunning
+                  Row {
+                    id: fortiRow
+                    anchors {
+                      left: parent.left
+                      right: parent.right
+                      verticalCenter: parent.verticalCenter
+                      leftMargin: Style.space(8)
+                      rightMargin: Style.space(8)
+                    }
+                    spacing: Style.space(8)
+                    Text {
+                      id: fortiIndicator
+                      text: vpn.forti.connected && vpn.forti.profile === modelData ? "●" : "○"
+                      color: vpn.forti.connected && vpn.forti.profile === modelData ? root.accent : root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                    }
+                    Column {
+                      width: Math.max(0, parent.width - fortiIndicator.width - fortiSwitch.width - fortiDelete.width - parent.spacing * 3)
+                      spacing: Style.space(1)
+                      Text {
+                        width: parent.width
+                        text: modelData
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                        elide: Text.ElideRight
+                      }
+                      Text {
+                        width: parent.width
+                        elide: Text.ElideRight
+                        text: vpn.fortiRowStatus(modelData)
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+                    ToggleSwitch {
+                      id: fortiSwitch
+                      anchors.verticalCenter: parent.verticalCenter
+                      checked: vpn.forti.connected && vpn.forti.profile === modelData
+                      busy: vpn.importing || vpn.actionRunning || (vpn.forti.state === "connecting" && vpn.forti.profile === modelData)
+                      foreground: root.foreground
+                      accent: root.accent
+                      hasCursor: root.cursorActive && root.profileIndex === vpn.profiles.length + vpn.azureProfiles.length + index
+                      Accessible.role: Accessible.CheckBox
+                      Accessible.name: modelData
+                      Accessible.checked: checked
+                      Accessible.onToggleAction: if (!busy) toggled()
+                      onToggled: {
+                        root.cursorActive = true
+                        root.profileIndex = vpn.profiles.length + vpn.azureProfiles.length + index
+                        vpn.toggleForti(modelData)
+                      }
+                    }
+                    DeleteControl {
+                      id: fortiDelete
+                      anchors.verticalCenter: parent.verticalCenter
+                      target: modelData
+                      label: modelData
+                      azureRegistry: false
+                      enabled: !vpn.importing && !vpn.actionRunning && !(vpn.forti.connected && vpn.forti.profile === modelData)
+                      onConfirmed: vpn.deleteForti(target)
+                    }
+                  }
+                  HoverHandler { id: fortiHover }
+                  ToolTip.visible: fortiHover.hovered
+                  ToolTip.text: modelData + " (FortiClient) · " + (vpn.fortiRowStatus(modelData))
+                }
+              }
             }
           }
 
-          Button {
+          Row {
             width: parent.width
-            text: vpn.importing ? "Working…" : "Import profile… (I)"
-            enabled: !vpn.importing && !vpn.actionRunning
-            Accessible.name: "Import VPN profile"
-            onClicked: vpn.profileAction("import")
+            spacing: Style.space(8)
+            Button {
+              width: Math.floor((parent.width - parent.spacing) / 2)
+              text: vpn.importing ? "Working…" : "Import (I)"
+              enabled: !vpn.importing && !vpn.actionRunning
+              Accessible.name: "Import VPN profile"
+              onClicked: vpn.profileAction("import")
+            }
+            Button {
+              width: Math.floor((parent.width - parent.spacing) / 2)
+              text: "New Forti (F)"
+              enabled: !vpn.importing && !vpn.actionRunning
+              Accessible.name: "Add FortiClient VPN profile"
+              onClicked: vpn.profileAction("form-forti")
+            }
           }
 
           Text {
@@ -849,7 +951,7 @@ Panel {
             width: parent.width
 
             text:
-              "↑↓ select · Enter connect/disconnect · D disconnect · R refresh · I import"
+              "↑↓ select · Enter connect/disconnect · D disconnect · R refresh · I import · F new forti"
 
             color:
               root.dim
