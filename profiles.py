@@ -564,8 +564,9 @@ def forti_connect_with_password(name, password):
         FORTI_ERROR_FILE.unlink(missing_ok=True)
     except Exception:
         pass
+    env = dict(os.environ, AIRZY_FORTI_PASS=password)
     p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "bg-connect-forti-pass", name],
-                         stdin=subprocess.PIPE, start_new_session=True,
+                         stdin=subprocess.PIPE, start_new_session=True, env=env,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         p.stdin.write(password.encode() + b"\n")
@@ -989,11 +990,15 @@ def main():
         return {"cleared": True}
     if action == "connect-forti-pass":
         name = sys.argv[2]
-        password = sys.stdin.readline().rstrip("\r\n") if not sys.stdin.isatty() else ""
+        password = os.environ.get("AIRZY_FORTI_PASS", "")
+        if not password and not sys.stdin.isatty():
+            password = sys.stdin.readline().rstrip("\r\n")
         return forti_connect_with_password(name, password)
     if action == "bg-connect-forti-pass":
         name = sys.argv[2]
-        password = sys.stdin.readline().rstrip("\r\n") if not sys.stdin.isatty() else ""
+        password = os.environ.get("AIRZY_FORTI_PASS", "")
+        if not password and not sys.stdin.isatty():
+            password = sys.stdin.readline().rstrip("\r\n")
         forti_connect_pass_bg(name, password)
         return {"done": True}
     if action == "list":

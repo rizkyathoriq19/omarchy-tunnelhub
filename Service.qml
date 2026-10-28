@@ -221,6 +221,11 @@ Item {
       pendingAction = action
       lastMessage = (action === "launch" || action === "connect-forti" || action === "connect-forti-pass") ? "Connecting…" : "Disconnecting…"
     }
+    if (input !== undefined && input !== "") {
+      importProcess.environment = { "AIRZY_FORTI_PASS": input }
+    } else {
+      importProcess.environment = {}
+    }
     var cmd = ["/usr/bin/python3", decodeURIComponent(Qt.resolvedUrl("profiles.py").toString().replace(/^file:\/\//, "")), action]
     if (path !== undefined) cmd.push(path)
     importProcess.command = cmd

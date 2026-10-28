@@ -301,6 +301,12 @@ Panel {
         id: panelFlick
 
         anchors.fill: parent
+        Connections {
+          target: vpn
+          function onAuthRequestChanged() {
+            if (vpn.authRequest !== "") panelFlick.contentY = 0
+          }
+        }
 
         contentWidth: width
         contentHeight: column.implicitHeight
@@ -321,75 +327,86 @@ Panel {
           spacing: Style.space(12)
 
           // Separate certificate and sudo requests share only the masked native field.
-          Column {
-            id: permissionPrompt
+          Rectangle {
+            id: permissionCard
             width: parent.width
+            implicitHeight: permissionPrompt.implicitHeight + Style.space(24)
             visible: vpn.authRequest !== ""
-            spacing: Style.space(8)
-            Connections {
-              target: vpn
-              function onAuthRequestChanged() {
-                if (vpn.authRequest) panelFlick.contentY = 0
+            radius: Style.space(6)
+            color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.15)
+            border.width: 1
+            border.color: root.accent
+
+            Column {
+              id: permissionPrompt
+              anchors {
+                left: parent.left
+                right: parent.right
+                top: parent.top
+                margins: Style.space(12)
               }
-            }
-            Text {
-              width: parent.width
-              text: vpn.certificatePrompt ? "VPN certificate password required" : (vpn.fortiPrompt ? "FortiClient VPN password required" : "System permission required")
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-            }
-            Text {
-              width: parent.width
-              text: vpn.certificatePrompt ? "Enter the password that unlocks your VPN certificate/private key, not your system password. Cancel stops this connection attempt." : (vpn.fortiPrompt ? ("Enter password for FortiClient profile '" + vpn.fortiRequest + "'. It will be saved securely for future connections.") : "Enter your system password for sudo. Cancel denies this request.")
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.Wrap
-            }
-            NativeUi.TextField {
-              id: permissionField
-              width: parent.width
-              password: true
-              maximumLength: 4092
-              placeholderText: vpn.certificatePrompt ? "Certificate password" : (vpn.fortiPrompt ? "VPN password" : "System password")
-              foreground: root.foreground
-              accent: root.accent
-              inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
-              Accessible.name: vpn.certificatePrompt ? "VPN certificate password" : (vpn.fortiPrompt ? "FortiClient VPN password" : "System password for sudo")
-              function submit() {
-                var response = text
-                text = ""
-                vpn.respondAuth(response)
-                response = ""
-              }
-              onAccepted: submit()
-              Keys.onReturnPressed: function(event) { event.accepted = true; submit() }
-              Keys.onEnterPressed: function(event) { event.accepted = true; submit() }
-              Keys.onEscapePressed: { text = ""; vpn.cancelAuth() }
-            }
-            Row {
               spacing: Style.space(8)
-              Button {
-                id: permissionSubmit
-                focusable: true
-                Accessible.role: Accessible.Button
-                Accessible.name: vpn.certificatePrompt ? "Submit certificate password" : (vpn.fortiPrompt ? "Submit FortiClient password" : "Submit system password")
-                Accessible.onPressAction: clicked()
-                text: "Submit"
-                enabled: permissionField.text.length > 0
-                onClicked: permissionField.submit()
-                Keys.onEscapePressed: { permissionField.text = ""; vpn.cancelAuth() }
+
+              Text {
+                width: parent.width
+                text: vpn.certificatePrompt ? "VPN certificate password required" : (vpn.fortiPrompt ? "FortiClient VPN password required" : "System permission required")
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
               }
-              Button {
-                id: permissionCancel
-                focusable: true
-                Accessible.role: Accessible.Button
-                Accessible.name: "Cancel permission request"
-                Accessible.onPressAction: clicked()
-                text: "Cancel"
-                onClicked: { permissionField.text = ""; vpn.cancelAuth() }
-                Keys.onEscapePressed: { permissionField.text = ""; vpn.cancelAuth() }
+              Text {
+                width: parent.width
+                text: vpn.certificatePrompt ? "Enter the password that unlocks your VPN certificate/private key, not your system password. Cancel stops this connection attempt." : (vpn.fortiPrompt ? ("Enter password for FortiClient profile '" + vpn.fortiRequest + "'. It will be saved securely for future connections.") : "Enter your system password for sudo. Cancel denies this request.")
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.Wrap
+              }
+              NativeUi.TextField {
+                id: permissionField
+                width: parent.width
+                password: true
+                maximumLength: 4092
+                placeholderText: vpn.certificatePrompt ? "Certificate password" : (vpn.fortiPrompt ? "VPN password" : "System password")
+                foreground: root.foreground
+                accent: root.accent
+                inputMethodHints: Qt.ImhSensitiveData | Qt.ImhNoPredictiveText | Qt.ImhNoAutoUppercase
+                Accessible.name: vpn.certificatePrompt ? "VPN certificate password" : (vpn.fortiPrompt ? "FortiClient VPN password" : "System password for sudo")
+                function submit() {
+                  var response = text
+                  text = ""
+                  vpn.respondAuth(response)
+                  response = ""
+                }
+                onAccepted: submit()
+                Keys.onReturnPressed: function(event) { event.accepted = true; submit() }
+                Keys.onEnterPressed: function(event) { event.accepted = true; submit() }
+                Keys.onEscapePressed: { text = ""; vpn.cancelAuth() }
+              }
+              Row {
+                spacing: Style.space(8)
+                Button {
+                  id: permissionSubmit
+                  focusable: true
+                  Accessible.role: Accessible.Button
+                  Accessible.name: vpn.certificatePrompt ? "Submit certificate password" : (vpn.fortiPrompt ? "Submit FortiClient password" : "Submit system password")
+                  Accessible.onPressAction: clicked()
+                  text: "Submit"
+                  enabled: permissionField.text.length > 0
+                  onClicked: permissionField.submit()
+                  Keys.onEscapePressed: { permissionField.text = ""; vpn.cancelAuth() }
+                }
+                Button {
+                  id: permissionCancel
+                  focusable: true
+                  Accessible.role: Accessible.Button
+                  Accessible.name: "Cancel permission request"
+                  Accessible.onPressAction: clicked()
+                  text: "Cancel"
+                  onClicked: { permissionField.text = ""; vpn.cancelAuth() }
+                  Keys.onEscapePressed: { permissionField.text = ""; vpn.cancelAuth() }
+                }
               }
             }
           }
