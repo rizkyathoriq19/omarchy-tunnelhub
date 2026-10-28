@@ -100,11 +100,67 @@ cannot echo a password into panel errors or logs. Responses are not cached or
 stored by the plugin. Qt/Python memory erasure, OS swap and other same-user
 processes are outside this protection.
 
-Only the native `vpn.secrets.cert-pass` prompt is supported here; other requests
-fail closed instead of being labelled as certificate or sudo passwords. For
-other authentication types or persistent credentials, use a trusted native
-NetworkManager editor/secret agent and its storage policy. Do not put passwords
-in shell arguments or manually copy an askpass file into plugin state.
+Only the native OpenVPN `vpn.secrets.cert-pass` and SSTP
+`vpn.secrets.tls-user-key-secret` prompts are supported here; both share the
+same masked certificate-password field and neither response is stored. Other
+requests fail closed instead of being labelled as certificate or sudo
+passwords. For other authentication types or persistent credentials, use a
+trusted native NetworkManager editor/secret agent and its storage policy. Do
+not put passwords in shell arguments or manually copy an askpass file into
+plugin state.
+
+## SSTP VPN with certificate authentication (EAP-TLS)
+
+Some Azure point-to-site gateways offer SSTP with certificate authentication
+(`VpnType=SSTP`, `Auth=EAPTLS` in `VpnSettings.xml`) instead of Entra ID with
+OpenVPN. OpenP2S cannot drive those gateways; use NetworkManager with the
+SSTP plugin. The widget lists and manages the resulting profile like any
+other NetworkManager VPN, and the masked certificate-password field answers
+the SSTP private-key password request. Nothing is stored by the plugin.
+
+Install the backend (once, needs sudo):
+
+```bash
+omarchy pkg add network-manager-sstp sstp-client ppp
+```
+
+Prepare PEM files from the gateway bundle in a private directory (mode 700,
+files mode 600). The `.cer` server root is DER; the `.pfx` holds the client
+certificate plus its private key. Keep the PFX password in its own file with
+mode 600, or type it when openssl asks:
+
+```bash
+mkdir -p ~/VPN/hiro && chmod 700 ~/VPN/hiro && cd ~/VPN/hiro
+# Server root: DER -> PEM
+openssl x509 -inform DER -in VpnServerRoot.cer -outform PEM -out server-root.pem
+# Client certificate (public part only)
+openssl pkcs12 -in ClientCert.pfx -nokeys -clcerts -out client-cert.pem
+# Client private key, kept encrypted with the same PFX password so
+# NetworkManager requests it through the panel at connect time
+openssl pkcs12 -in ClientCert.pfx -nocerts -out client-key.pem
+chmod 600 *.pem
+# Sanity check: key must stay encrypted and match the certificate
+head -n 1 client-key.pem  # expect: -----BEGIN ENCRYPTED PRIVATE KEY-----
+```
+
+Create the profile from the `VpnSettings.xml` values (gateway, routes,
+client address pool, DNS). Replace the placeholders with your bundle's
+values; the key stays encrypted and its password is never stored:
+
+```bash
+nmcli connection add type vpn con-name HIRO-GW ifname '*' vpn-type sstp \
+  +vpn.data "gateway = <VpnServer>, connection-type = tls, tls-user-cert = $HOME/VPN/hiro/client-cert.pem, tls-user-key = $HOME/VPN/hiro/client-key.pem, tls-user-key-secret-flags = 2, tls-ca-cert = $HOME/VPN/hiro/server-root.pem, ca-cert = $HOME/VPN/hiro/server-root.pem, ignore-cert-warn = no, tls-ext = yes, require-mppe = yes, refuse-eap = no, refuse-pap = yes, refuse-chap = yes, refuse-mschap = yes, refuse-mschapv2 = yes, nobsdcomp = yes, nodeflate = yes" \
+  ipv4.dns <CustomDnsServers> ipv4.ignore-auto-dns yes ipv4.never-default yes ipv6.method disabled
+# Add each <Routes> entry plus the <VpnClientAddressPool> as its own route:
+nmcli connection modify HIRO-GW +ipv4.routes "<route-1>" +ipv4.routes "<route-2>"
+```
+
+Connect from the panel like any NetworkManager profile; enter the private-key
+password in the masked field when asked. Client certificates from enterprise
+gateways often expire quickly; if a previously working profile stops
+connecting, check the certificate dates first (`openssl x509 -noout -dates
+-in client-cert.pem`). Never include certificates, keys, passwords or
+personal gateway hostnames in the plugin repository or issue reports.
 
 ## Azure VPN with OpenP2S
 
