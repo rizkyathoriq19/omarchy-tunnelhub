@@ -165,7 +165,7 @@ Item {
       else if (nmActive) disconnectNm()
       if (fortiSaved[name] !== true) {
         root.fortiRequest = name
-        lastMessage = ""
+        lastMessage = "Password required for '" + name + "'"
         lastError = ""
       } else {
         profileAction("connect-forti", name)

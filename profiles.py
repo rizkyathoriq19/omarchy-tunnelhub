@@ -390,12 +390,6 @@ def heal_network_on_connect(vpn_iface=None):
                            capture_output=True, text=True, timeout=3)
         except Exception:
             pass
-        try:
-            resolvectl = require("resolvectl")
-            subprocess.run([resolvectl, "default-route", vpn_iface, "no"],
-                           capture_output=True, text=True, timeout=3)
-        except Exception:
-            pass
 
     if not has_physical_default_route():
         try:
@@ -404,13 +398,6 @@ def heal_network_on_connect(vpn_iface=None):
                            capture_output=True, text=True, timeout=5)
         except Exception:
             pass
-
-    try:
-        resolvectl = require("resolvectl")
-        subprocess.run([resolvectl, "default-route", phys_dev, "yes"],
-                       capture_output=True, text=True, timeout=3)
-    except Exception:
-        pass
 
 
 def restore_network_on_disconnect():
@@ -421,31 +408,6 @@ def restore_network_on_disconnect():
             nmcli = require("nmcli")
             subprocess.run([nmcli, "device", "reapply", phys_dev],
                            capture_output=True, text=True, timeout=5)
-        except Exception:
-            pass
-
-    if phys_dev:
-        try:
-            resolvectl = require("resolvectl")
-            subprocess.run([resolvectl, "default-route", phys_dev, "yes"],
-                           capture_output=True, text=True, timeout=3)
-        except Exception:
-            pass
-
-    dns_ok = False
-    try:
-        resolvectl = require("resolvectl")
-        check = subprocess.run([resolvectl, "query", "--legend=no", "google.com"],
-                               capture_output=True, text=True, timeout=2)
-        dns_ok = (check.returncode == 0)
-    except Exception:
-        dns_ok = False
-
-    if not dns_ok:
-        provider = current_dns_provider()
-        try:
-            subprocess.run(["sudo", "-n", "/usr/bin/omarchy-dns", provider],
-                           capture_output=True, text=True, timeout=8)
         except Exception:
             pass
 
@@ -474,42 +436,16 @@ def check_and_heal_network(res):
     if forti_now:
         if not forti_prev or not has_physical_default_route():
             heal_network_on_connect(forti_info.get("interface"))
-    elif forti_prev or azure_prev:
+    elif (forti_prev and not forti_now) or (azure_prev and not azure_now):
         restore_network_on_disconnect()
     elif not forti_now and not azure_now and not has_physical_default_route():
         restore_network_on_disconnect()
-
     try:
         STATE_FILE.write_text(json.dumps({"forti_connected": forti_now, "azure_connected": azure_now}))
     except Exception:
         pass
 
 
-_NM_NEVER_DEFAULT_CHECK_TIME = 0
-
-def ensure_nm_vpns_never_default():
-    global _NM_NEVER_DEFAULT_CHECK_TIME
-    now = time.time()
-    if now - _NM_NEVER_DEFAULT_CHECK_TIME < 60:
-        return
-    _NM_NEVER_DEFAULT_CHECK_TIME = now
-    try:
-        nmcli = require("nmcli")
-        res = subprocess.run([nmcli, "-t", "-f", "NAME,UUID,TYPE", "connection", "show"],
-                             capture_output=True, text=True, timeout=5)
-        if res.returncode == 0:
-            for line in res.stdout.splitlines():
-                parts = line.split(":")
-                if len(parts) >= 3 and parts[2] in ("vpn", "wireguard"):
-                    uuid = parts[1]
-                    check = subprocess.run([nmcli, "-g", "ipv4.never-default", "connection", "show", uuid],
-                                           capture_output=True, text=True, timeout=3)
-                    if check.stdout.strip() != "yes":
-                        subprocess.run([nmcli, "connection", "modify", uuid,
-                                        "ipv4.never-default", "yes", "ipv6.never-default", "yes"],
-                                       capture_output=True, text=True, timeout=5)
-    except Exception:
-        pass
 
 
 def forti_connect_pty(name, password):
@@ -544,12 +480,13 @@ def forti_connect_pty(name, password):
                 if not chunk:
                     break
                 buf += chunk
+                while b"Confirm (y/n)" in buf:
+                    os.write(master, b"y\n")
+                    buf = buf.replace(b"Confirm (y/n)", b"CONFIRMED", 1)
                 if not sent_pass and b"Password:" in buf:
                     os.write(master, (password + "\n").encode())
                     sent_pass = True
-                if not confirmed and b"Confirm (y/n)" in buf:
-                    os.write(master, b"y\n")
-                    confirmed = True
+                    buf = buf.replace(b"Password:", b"SENT_PW", 1)
                 if b"Status: Connected" in buf or b"Status: Disconnected" in buf or b"Notification: Login failed" in buf or b"Notification: Login canceled" in buf:
                     if b"Status: Connected" in buf:
                         connected = True
@@ -635,7 +572,7 @@ def forti_connect_bg(name):
     try:
         p = subprocess.Popen([client, "vpn", "connect", name],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        stdout, _ = p.communicate(input="y\n", timeout=10)
+        stdout, _ = p.communicate(input="y\ny\ny\n", timeout=25)
         if "Insufficient credential" in stdout:
             FORTI_ERROR_FILE.write_text(f"PASSWORD_REQUIRED:{name}")
         elif "Login canceled" in stdout:
@@ -1016,7 +953,6 @@ def disconnect():
 def main():
     action = sys.argv[1]
     if action == "status":
-        ensure_nm_vpns_never_default()
         res = dict(status(), operation=operation_status(), forti=forti_status())
         check_and_heal_network(res)
         return res

@@ -95,7 +95,7 @@ def run(profile, command='nmcli', timeout=90):
                         return 3
                     elif any(len(known) > len(prompt) and known.startswith(prompt) for known in prompts):
                         pass  # Partial prompt; wait for more input.
-                    elif output.endswith(b': '):
+                    elif output.endswith(b': ') and not output.startswith((b'Connection ', b'Error: ')):
                         return 3
                 else:
                     if not chunk:
