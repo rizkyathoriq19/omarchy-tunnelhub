@@ -76,6 +76,7 @@ Item {
   property var azureOperation: ({known: false, running: null, stopping: null, error: ""})
   readonly property bool azureOperationKnown: azureOperation.known === true && typeof azureOperation.running === "boolean" && typeof azureOperation.stopping === "boolean"
   readonly property bool azurePending: azureOperation.running === true && !azure.connected
+  readonly property bool fortiPending: (pendingAction === "connect-forti" || pendingAction === "connect-forti-pass") && !forti.connected
   readonly property string azureDisplayState: azureOperation.stopping ? "disconnecting" : (azurePending ? "connecting" : azure.state)
   readonly property string activeProfile: azure.connected ? (azure.path ? azure.path.split("/").pop() : "VPN") : (forti.connected ? forti.profile : nmProfile)
   readonly property string activeType: azure.connected ? "Azure OpenP2S" : (forti.connected ? "FortiClient SSL-VPN" : (nmType ? profileTypeLabel(nmType) + " (NetworkManager)" : ""))
@@ -155,7 +156,11 @@ Item {
     if (azureOperation.stopping) return
     if (azure.path === path && (azure.connected || azureOperation.running || ["reconnecting", "disconnecting", "stale"].indexOf(azure.state) !== -1)) profileAction("disconnect")
     else if (azureOperation.path === path && azureOperation.running) profileAction("disconnect")
-    else profileAction("launch", path)
+    else {
+      if (forti.connected) profileAction("disconnect-forti")
+      else if (nmActive) disconnectNm()
+      profileAction("launch", path)
+    }
   }
   function toggleForti(name) {
     if (forti.connected && forti.profile === name) {
@@ -163,13 +168,7 @@ Item {
     } else {
       if (azure.connected || azureOperation.running) profileAction("disconnect")
       else if (nmActive) disconnectNm()
-      if (fortiSaved[name] !== true) {
-        root.fortiRequest = name
-        lastMessage = "Password required for '" + name + "'"
-        lastError = ""
-      } else {
-        profileAction("connect-forti", name)
-      }
+      profileAction("connect-forti", name)
     }
   }
   function deleteForti(name) {
@@ -458,6 +457,8 @@ Item {
       disconnectNm(uuid)
       return
     }
+    if (azure.connected || azureOperation.running) profileAction("disconnect")
+    else if (forti.connected) profileAction("disconnect-forti")
 
     if (nmUuid !== "") {
       actionRunning = true

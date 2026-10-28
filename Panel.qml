@@ -326,6 +326,12 @@ Panel {
             width: parent.width
             visible: vpn.authRequest !== ""
             spacing: Style.space(8)
+            Connections {
+              target: vpn
+              function onAuthRequestChanged() {
+                if (vpn.authRequest) panelFlick.contentY = 0
+              }
+            }
             Text {
               width: parent.width
               text: vpn.certificatePrompt ? "VPN certificate password required" : (vpn.fortiPrompt ? "FortiClient VPN password required" : "System permission required")
@@ -779,7 +785,7 @@ Panel {
                       id: azureSwitch
                       anchors.verticalCenter: parent.verticalCenter
                       checked: vpn.azure.connected && vpn.azure.path === modelData
-                      busy: vpn.importing || vpn.actionRunning || vpn.azureOperation.stopping
+                      busy: vpn.importing || vpn.actionRunning || vpn.azurePending || vpn.azureOperation.stopping
                       foreground: root.foreground
                       accent: root.accent
                       hasCursor: root.cursorActive && root.profileIndex === vpn.profiles.length + index
@@ -862,7 +868,7 @@ Panel {
                       id: fortiSwitch
                       anchors.verticalCenter: parent.verticalCenter
                       checked: vpn.forti.connected && vpn.forti.profile === modelData
-                      busy: vpn.importing || vpn.actionRunning || (vpn.forti.state === "connecting" && vpn.forti.profile === modelData)
+                      busy: vpn.importing || vpn.actionRunning || vpn.fortiPending || (vpn.forti.state === "connecting" && vpn.forti.profile === modelData)
                       foreground: root.foreground
                       accent: root.accent
                       hasCursor: root.cursorActive && root.profileIndex === vpn.profiles.length + vpn.azureProfiles.length + index
