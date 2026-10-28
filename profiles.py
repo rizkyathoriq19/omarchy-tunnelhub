@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from permission import Lease
 import ovpn_source
 
@@ -232,6 +233,20 @@ def forti_list():
 
 FORTI_ERROR_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "airzy.vpn-forti-error.txt"
 
+_SAVED_CACHE = {}
+_SAVED_CACHE_TIME = 0
+
+def get_forti_saved():
+    global _SAVED_CACHE, _SAVED_CACHE_TIME
+    now = time.time()
+    if now - _SAVED_CACHE_TIME < 30 and _SAVED_CACHE:
+        return _SAVED_CACHE
+    try:
+        _SAVED_CACHE = {p: forti_has_password(p) for p in forti_list()}
+        _SAVED_CACHE_TIME = now
+    except Exception:
+        pass
+    return _SAVED_CACHE
 
 def forti_status():
     if not forti_installed():
@@ -296,10 +311,199 @@ def forti_status():
             "interface": interface,
             "address": address,
             "error": error,
-            "passwordRequired": password_req
+            "passwordRequired": password_req,
+            "saved": get_forti_saved()
         }
     except Exception:
-        return {"installed": True, "state": "unknown", "connected": False, "profile": "", "interface": "", "address": "", "error": "", "passwordRequired": ""}
+        return {"installed": True, "state": "unknown", "connected": False, "profile": "", "interface": "", "address": "", "error": "", "passwordRequired": "", "saved": {}}
+
+def active_physical_device():
+    try:
+        nmcli = require("nmcli")
+        res = subprocess.run([nmcli, "-t", "-f", "DEVICE,TYPE,STATE,CON-UUID", "device", "status"],
+                             capture_output=True, text=True, timeout=3)
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                parts = line.split(":")
+                if len(parts) >= 4 and parts[2] == "connected" and parts[1] in ("wifi", "ethernet"):
+                    return parts[0], parts[3]
+    except Exception:
+        pass
+    return None, None
+
+
+def has_physical_default_route():
+    try:
+        ip = require("ip")
+        res = subprocess.run([ip, "-j", "route", "show", "default"],
+                             capture_output=True, text=True, timeout=3)
+        if res.returncode == 0:
+            routes = json.loads(res.stdout)
+            for r in routes:
+                dev = r.get("dev", "")
+                if dev and not dev.startswith(("fctvpn", "tun", "tap", "ppp", "wg")):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def current_dns_provider():
+    try:
+        res = subprocess.run(["omarchy-dns"], capture_output=True, text=True, timeout=3)
+        p = res.stdout.strip()
+        if p in ("DHCP", "Cloudflare", "Google"):
+            return p
+    except Exception:
+        pass
+    return "DHCP"
+
+
+def heal_network_on_connect(vpn_iface=None):
+    phys_dev, _ = active_physical_device()
+    if not phys_dev:
+        return
+
+    if not vpn_iface:
+        try:
+            ip = require("ip")
+            res = subprocess.run([ip, "-j", "link", "show"], capture_output=True, text=True, timeout=3)
+            if res.returncode == 0:
+                for link in json.loads(res.stdout):
+                    name = link.get("ifname", "")
+                    if name.startswith("fctvpn"):
+                        vpn_iface = name
+                        break
+        except Exception:
+            pass
+
+    if vpn_iface:
+        try:
+            nmcli = require("nmcli")
+            subprocess.run([nmcli, "device", "set", vpn_iface, "managed", "no"],
+                           capture_output=True, text=True, timeout=3)
+        except Exception:
+            pass
+        try:
+            resolvectl = require("resolvectl")
+            subprocess.run([resolvectl, "default-route", vpn_iface, "no"],
+                           capture_output=True, text=True, timeout=3)
+        except Exception:
+            pass
+
+    if not has_physical_default_route():
+        try:
+            nmcli = require("nmcli")
+            subprocess.run([nmcli, "device", "reapply", phys_dev],
+                           capture_output=True, text=True, timeout=5)
+        except Exception:
+            pass
+
+    try:
+        resolvectl = require("resolvectl")
+        subprocess.run([resolvectl, "default-route", phys_dev, "yes"],
+                       capture_output=True, text=True, timeout=3)
+    except Exception:
+        pass
+
+
+def restore_network_on_disconnect():
+    phys_dev, _ = active_physical_device()
+
+    if not has_physical_default_route() and phys_dev:
+        try:
+            nmcli = require("nmcli")
+            subprocess.run([nmcli, "device", "reapply", phys_dev],
+                           capture_output=True, text=True, timeout=5)
+        except Exception:
+            pass
+
+    if phys_dev:
+        try:
+            resolvectl = require("resolvectl")
+            subprocess.run([resolvectl, "default-route", phys_dev, "yes"],
+                           capture_output=True, text=True, timeout=3)
+        except Exception:
+            pass
+
+    dns_ok = False
+    try:
+        resolvectl = require("resolvectl")
+        check = subprocess.run([resolvectl, "query", "--legend=no", "google.com"],
+                               capture_output=True, text=True, timeout=2)
+        dns_ok = (check.returncode == 0)
+    except Exception:
+        dns_ok = False
+
+    if not dns_ok:
+        provider = current_dns_provider()
+        try:
+            subprocess.run(["sudo", "-n", "/usr/bin/omarchy-dns", provider],
+                           capture_output=True, text=True, timeout=8)
+        except Exception:
+            pass
+
+    try:
+        resolvectl = require("resolvectl")
+        subprocess.run([resolvectl, "flush-caches"],
+                       capture_output=True, text=True, timeout=3)
+    except Exception:
+        pass
+
+
+STATE_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "airzy.vpn-runtime-state.json"
+
+def check_and_heal_network(res):
+    try:
+        last_state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+    except Exception:
+        last_state = {}
+
+    forti_info = res.get("forti", {})
+    forti_now = forti_info.get("connected", False)
+    azure_now = res.get("connected", False)
+    forti_prev = last_state.get("forti_connected", False)
+    azure_prev = last_state.get("azure_connected", False)
+
+    if forti_now:
+        if not forti_prev or not has_physical_default_route():
+            heal_network_on_connect(forti_info.get("interface"))
+    elif forti_prev or azure_prev:
+        restore_network_on_disconnect()
+    elif not forti_now and not azure_now and not has_physical_default_route():
+        restore_network_on_disconnect()
+
+    try:
+        STATE_FILE.write_text(json.dumps({"forti_connected": forti_now, "azure_connected": azure_now}))
+    except Exception:
+        pass
+
+
+_NM_NEVER_DEFAULT_CHECK_TIME = 0
+
+def ensure_nm_vpns_never_default():
+    global _NM_NEVER_DEFAULT_CHECK_TIME
+    now = time.time()
+    if now - _NM_NEVER_DEFAULT_CHECK_TIME < 60:
+        return
+    _NM_NEVER_DEFAULT_CHECK_TIME = now
+    try:
+        nmcli = require("nmcli")
+        res = subprocess.run([nmcli, "-t", "-f", "NAME,UUID,TYPE", "connection", "show"],
+                             capture_output=True, text=True, timeout=5)
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                parts = line.split(":")
+                if len(parts) >= 3 and parts[2] in ("vpn", "wireguard"):
+                    uuid = parts[1]
+                    check = subprocess.run([nmcli, "-g", "ipv4.never-default", "connection", "show", uuid],
+                                           capture_output=True, text=True, timeout=3)
+                    if check.stdout.strip() != "yes":
+                        subprocess.run([nmcli, "connection", "modify", uuid,
+                                        "ipv4.never-default", "yes", "ipv6.never-default", "yes"],
+                                       capture_output=True, text=True, timeout=5)
+    except Exception:
+        pass
 
 
 def forti_connect_pty(name, password):
@@ -384,6 +588,7 @@ def forti_connect_pass_bg(name, password):
                 FORTI_ERROR_FILE.unlink(missing_ok=True)
             except Exception:
                 pass
+            heal_network_on_connect()
         elif "Insufficient credential" in pty_out or "Login failed" in pty_out:
             FORTI_ERROR_FILE.write_text("Incorrect password or authentication rejected by VPN server.")
         elif "Login canceled" in pty_out:
@@ -429,7 +634,9 @@ def forti_connect_bg(name):
             FORTI_ERROR_FILE.write_text(f"PASSWORD_REQUIRED:{name}")
         elif "Login canceled" in stdout:
             FORTI_ERROR_FILE.write_text("Connection cancelled by FortiClient.")
-        elif "Status: Connected" not in stdout:
+        elif "Status: Connected" in stdout:
+            heal_network_on_connect()
+        else:
             for line in stdout.splitlines():
                 if "Notification:" in line:
                     FORTI_ERROR_FILE.write_text(line.strip())
@@ -460,6 +667,7 @@ def forti_disconnect():
     res = subprocess.run([client, "vpn", "disconnect"], capture_output=True, text=True, timeout=10)
     if res.returncode != 0:
         raise ValueError("Failed to disconnect FortiClient.")
+    restore_network_on_disconnect()
     return {"message": "FortiClient disconnected."}
 
 def forti_delete(name):
@@ -543,10 +751,20 @@ def import_path(path):
                                   capture_output=True, text=True, timeout=15, env=env)
         if verified.returncode or verified.stdout.splitlines() != [profile, "vpn", "org.freedesktop.NetworkManager.openvpn"]:
             raise ValueError("Profile imported, but its identity could not be verified. Source was not registered.")
+        subprocess.run([require("nmcli"), "connection", "modify", profile,
+                        "ipv4.never-default", "yes", "ipv6.never-default", "yes"],
+                       capture_output=True, text=True, timeout=10)
         sources = ovpn_source.load()
         sources[profile] = path
         ovpn_source.save(sources)
         prepare_nm_certificate(profile)
+    elif kind == "wireguard":
+        match = re.fullmatch(r"Connection '[^\r\n]*' \(([0-9a-f-]{36})\) successfully added\.\n?", result.stdout)
+        profile = match[1] if match else ""
+        if profile and ovpn_source.valid_uuid(profile):
+            subprocess.run([require("nmcli"), "connection", "modify", profile,
+                            "ipv4.never-default", "yes", "ipv6.never-default", "yes"],
+                           capture_output=True, text=True, timeout=10)
     return {"message": "Profile imported."}
 
 
@@ -785,13 +1003,17 @@ def disconnect():
             or operation["running"] or operation["stopping"]):
         raise ValueError("Disconnection is not confirmed. Refresh and retry cleanup.")
     control("reset-failed", check=False)  # Clear a prior unit failure only after native cleanup is confirmed.
+    restore_network_on_disconnect()
     return {"message": "Disconnected."}
 
 
 def main():
     action = sys.argv[1]
     if action == "status":
-        return dict(status(), operation=operation_status(), forti=forti_status())
+        ensure_nm_vpns_never_default()
+        res = dict(status(), operation=operation_status(), forti=forti_status())
+        check_and_heal_network(res)
+        return res
     if action == "disconnect":
         return disconnect()
     if action == "bg-connect-forti":
@@ -799,6 +1021,9 @@ def main():
         return {"done": True}
     if action == "connect-forti":
         return forti_connect(sys.argv[2])
+    if action == "restore-network":
+        restore_network_on_disconnect()
+        return {"done": True}
     if action == "disconnect-forti":
         return forti_disconnect()
     if action == "delete-forti":
@@ -822,7 +1047,7 @@ def main():
         return {"done": True}
     if action == "list":
         profiles = forti_list()
-        saved = {p: forti_has_password(p) for p in profiles}
+        saved = get_forti_saved()
         return {"azure": load(), "forti": profiles, "fortiSaved": saved}
     if action == "details-nm":
         return nm_details(sys.argv[2])
