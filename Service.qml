@@ -77,6 +77,7 @@ Item {
   readonly property bool azureOperationKnown: azureOperation.known === true && typeof azureOperation.running === "boolean" && typeof azureOperation.stopping === "boolean"
   readonly property bool azurePending: azureOperation.running === true && !azure.connected
   readonly property bool fortiPending: (pendingAction === "connect-forti" || pendingAction === "connect-forti-pass") && !forti.connected
+  readonly property bool nmActive: nmStateKnown && nmUuid !== ""
   readonly property string azureDisplayState: azureOperation.stopping ? "disconnecting" : (azurePending ? "connecting" : azure.state)
   readonly property string activeProfile: azure.connected ? (azure.path ? azure.path.split("/").pop() : "VPN") : (forti.connected ? forti.profile : nmProfile)
   readonly property string activeType: azure.connected ? "Azure OpenP2S" : (forti.connected ? "FortiClient SSL-VPN" : (nmType ? profileTypeLabel(nmType) + " (NetworkManager)" : ""))
@@ -160,22 +161,44 @@ Item {
   }
   function toggleAzure(path) {
     if (azureOperation.stopping) return
-    if (azure.path === path && (azure.connected || azureOperation.running || ["reconnecting", "disconnecting", "stale"].indexOf(azure.state) !== -1)) profileAction("disconnect")
-    else if (azureOperation.path === path && azureOperation.running) profileAction("disconnect")
-    else {
-      if (forti.connected) profileAction("disconnect-forti")
-      else if (nmActive) disconnectNm()
-      profileAction("launch", path)
+    if (azure.path === path && (azure.connected || azureOperation.running || ["reconnecting", "disconnecting", "stale"].indexOf(azure.state) !== -1)) {
+      profileAction("disconnect")
+      return
     }
+    if (azureOperation.path === path && azureOperation.running) {
+      profileAction("disconnect")
+      return
+    }
+    if (forti.connected) {
+      profileAction("disconnect-forti")
+      return
+    }
+    if (nmActive) {
+      disconnectNm()
+      return
+    }
+    profileAction("launch", path)
   }
   function toggleForti(name) {
     if (forti.connected && forti.profile === name) {
       profileAction("disconnect-forti")
-    } else {
-      if (azure.connected || azureOperation.running) profileAction("disconnect")
-      else if (nmActive) disconnectNm()
-      profileAction("connect-forti", name)
+      return
     }
+    if (azure.connected || azureOperation.running) {
+      profileAction("disconnect")
+      return
+    }
+    if (nmActive) {
+      disconnectNm()
+      return
+    }
+    if (fortiSaved[name] !== true) {
+      root.fortiRequest = name
+      lastMessage = "Enter password for '" + name + "' below"
+      lastError = ""
+      return
+    }
+    profileAction("connect-forti", name)
   }
   function deleteForti(name) {
     profileAction("delete-forti", name)
@@ -197,8 +220,9 @@ Item {
       pendingAction = action
       lastMessage = (action === "launch" || action === "connect-forti" || action === "connect-forti-pass") ? "Connecting…" : "Disconnecting…"
     }
-    importProcess.command = ["/usr/bin/python3", decodeURIComponent(Qt.resolvedUrl("profiles.py").toString().replace(/^file:\/\//, "")), action]
-    if (path !== undefined) importProcess.command = importProcess.command.concat([path])
+    var cmd = ["/usr/bin/python3", decodeURIComponent(Qt.resolvedUrl("profiles.py").toString().replace(/^file:\/\//, "")), action]
+    if (path !== undefined) cmd.push(path)
+    importProcess.command = cmd
     importProcess.running = true
     if (input !== undefined) {
       importProcess.write(input + "\n")
@@ -463,9 +487,15 @@ Item {
       disconnectNm(uuid)
       return
     }
-    if (azure.connected || azureOperation.running) profileAction("disconnect")
-    else if (forti.connected) profileAction("disconnect-forti")
 
+    if (azure.connected || azureOperation.running) {
+      profileAction("disconnect")
+      return
+    }
+    if (forti.connected) {
+      profileAction("disconnect-forti")
+      return
+    }
     if (nmUuid !== "") {
       actionRunning = true
       lastError = ""
