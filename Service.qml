@@ -209,7 +209,8 @@ Item {
   function rowAction(state) {
     return ["connected", "connecting", "reconnecting"].indexOf(state) !== -1 ? "Disconnect" : "Connect"
   }
-  Timer { interval: 3000; running: root.lastMessage !== ""; onTriggered: { root.lastMessage = ""; root.pendingAction = "" } }
+  Timer { interval: 4000; running: root.lastMessage !== "" && root.pendingAction === ""; onTriggered: root.lastMessage = "" }
+  Timer { interval: 40000; running: root.pendingAction !== ""; onTriggered: { root.pendingAction = ""; root.lastMessage = "" } }
   readonly property bool importing: importProcess.running
 
   function profileAction(action, path, input) {

@@ -465,47 +465,54 @@ def forti_connect_pty(name, password):
         os.close(slave)
         buf = b""
         sent_pass = False
-        confirmed = False
         start = time.time()
         connected = False
+        last_check = 0
         try:
-            while time.time() - start < 25:
-                r, _, _ = select.select([master], [], [], 0.5)
-                if not r:
-                    continue
-                try:
-                    chunk = os.read(master, 1024)
-                except OSError:
-                    break
-                if not chunk:
-                    break
-                buf += chunk
-                while b"Confirm (y/n)" in buf:
-                    os.write(master, b"y\n")
-                    buf = buf.replace(b"Confirm (y/n)", b"CONFIRMED", 1)
-                if not sent_pass and b"Password:" in buf:
-                    os.write(master, (password + "\n").encode())
-                    sent_pass = True
-                    buf = buf.replace(b"Password:", b"SENT_PW", 1)
-                if b"Status: Connected" in buf or b"Status: Disconnected" in buf or b"Notification: Login failed" in buf or b"Notification: Login canceled" in buf:
-                    if b"Status: Connected" in buf:
-                        connected = True
-                    time.sleep(0.5)
+            while time.time() - start < 35:
+                r, _, _ = select.select([master], [], [], 0.3)
+                if r:
                     try:
-                        buf += os.read(master, 1024)
-                    except Exception:
-                        pass
+                        chunk = os.read(master, 1024)
+                    except OSError:
+                        chunk = b""
+                    if chunk:
+                        buf += chunk
+                        while b"Confirm (y/n)" in buf:
+                            os.write(master, b"y\n")
+                            buf = buf.replace(b"Confirm (y/n)", b"CONFIRMED", 1)
+                        if not sent_pass and b"Password:" in buf:
+                            os.write(master, (password + "\n").encode())
+                            sent_pass = True
+                            buf = buf.replace(b"Password:", b"SENT_PW", 1)
+
+                if b"Notification: Login failed" in buf or b"Notification: Login canceled" in buf or b"Insufficient credential" in buf:
                     break
+                if b"Status: Connected" in buf or b"FCT_VPN_CONNECTED" in buf or b"Tunnel is up" in buf:
+                    connected = True
+                    break
+
+                now = time.time()
+                if sent_pass and (now - last_check > 1.0):
+                    last_check = now
+                    st = forti_status()
+                    if st.get("connected"):
+                        connected = True
+                        break
         finally:
             try:
                 os.close(master)
             except Exception:
                 pass
             if not connected:
-                try:
-                    os.kill(pid, 9)
-                except Exception:
-                    pass
+                st = forti_status()
+                if st.get("connected"):
+                    connected = True
+                else:
+                    try:
+                        os.kill(pid, 9)
+                    except Exception:
+                        pass
             try:
                 os.waitpid(pid, 0)
             except Exception:
@@ -526,12 +533,13 @@ def forti_has_password(name):
 def forti_connect_pass_bg(name, password):
     try:
         pty_out = forti_connect_pty(name, password)
-        if "Status: Connected" in pty_out:
+        st = forti_status()
+        if st.get("connected") or "Status: Connected" in pty_out or "FCT_VPN_CONNECTED" in pty_out:
             try:
                 FORTI_ERROR_FILE.unlink(missing_ok=True)
             except Exception:
                 pass
-            heal_network_on_connect()
+            heal_network_on_connect(st.get("interface"))
         elif "Insufficient credential" in pty_out or "Login failed" in pty_out:
             FORTI_ERROR_FILE.write_text("Incorrect password or authentication rejected by VPN server.")
         elif "Login canceled" in pty_out:
@@ -573,12 +581,13 @@ def forti_connect_bg(name):
         p = subprocess.Popen([client, "vpn", "connect", name],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         stdout, _ = p.communicate(input="y\ny\ny\n", timeout=25)
-        if "Insufficient credential" in stdout:
+        st = forti_status()
+        if st.get("connected") or "Connected" in stdout or "FCT_VPN_CONNECTED" in stdout:
+            heal_network_on_connect(st.get("interface"))
+        elif "Insufficient credential" in stdout:
             FORTI_ERROR_FILE.write_text(f"PASSWORD_REQUIRED:{name}")
         elif "Login canceled" in stdout:
             FORTI_ERROR_FILE.write_text("Connection cancelled by FortiClient.")
-        elif "Status: Connected" in stdout:
-            heal_network_on_connect()
         else:
             for line in stdout.splitlines():
                 if "Notification:" in line:
