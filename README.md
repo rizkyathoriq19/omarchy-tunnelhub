@@ -264,19 +264,27 @@ configuration blocks connection; the plugin never enables system-store or insecu
 verification fallbacks. Enable `azureExperimentalCompat` (default false) only if
 your gateway requires OpenP2S's `--experimental-azure-compat` workaround.
 
-Settings are inline on the `airzy.vpn` entry in `~/.config/omarchy/shell.json`,
-under `bar.layout.left`, `center` or `right`, for example:
+### Azure CA Configuration in `shell.json`
 
-```json
-{"id": "airzy.vpn", "azureCaPath": "/absolute/path/to/trusted-root.pem", "azureExperimentalCompat": false}
+Azure Point-to-Site requires an absolute path to a trusted CA root certificate (e.g. DigiCert Global Root CA). The plugin reads `azureCaPath` directly from its widget entry in `~/.config/omarchy/shell.json`.
+
+Set the CA path via the Omarchy CLI:
+
+```bash
+omarchy bar set airzy.vpn azureCaPath "/absolute/path/to/trusted-root.pem"
 ```
 
-Both the launch action and durable supervisor read that entry independently;
-settings changes apply to the next connection, not an existing session. Existing
-installations moving from hardcoded settings should copy their previously working
-CA path and compatibility choice into this local entry before updating. Never
-include user configuration or certificates in the plugin repository.
+Or edit `~/.config/omarchy/shell.json` manually under `bar.layout` (`left`, `center`, or `right`):
 
+```json
+{
+  "id": "airzy.vpn",
+  "azureCaPath": "/home/airzy/.local/share/ca/DigiCertGlobalRootCA.pem",
+  "azureExperimentalCompat": false
+}
+```
+
+> **Note:** Running `omarchy plugin enable airzy.vpn` or resetting the bar layout can overwrite inline widget attributes with `{ "id": "airzy.vpn" }`. If you see the message `Configure azureCaPath with an absolute trusted CA certificate path before connecting`, re-run the `omarchy bar set` command above.
 Press **Ctrl+C** in the running terminal to disconnect, or use another terminal:
 
 ```bash
