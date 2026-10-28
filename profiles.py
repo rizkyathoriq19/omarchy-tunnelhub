@@ -254,16 +254,33 @@ def get_forti_saved():
         pass
     return _SAVED_CACHE
 
+def get_fctvpn_interface():
+    try:
+        ip = require("ip")
+        res = subprocess.run([ip, "-j", "addr", "show"], capture_output=True, text=True, timeout=2)
+        if res.returncode == 0:
+            for dev in json.loads(res.stdout):
+                ifname = dev.get("ifname", "")
+                if ifname.startswith("fctvpn"):
+                    addrs = dev.get("addr_info", [])
+                    ipv4 = next((a.get("local", "") for a in addrs if a.get("family") == "inet"), "")
+                    return ifname, ipv4
+    except Exception:
+        pass
+    return "", ""
+
 def forti_status():
     if not forti_installed():
         return {"installed": False, "state": "not_installed", "connected": False, "profile": "", "interface": "", "address": "", "error": "", "passwordRequired": "", "saved": {}}
+    ifname, ip_addr = get_fctvpn_interface()
+    state = "connected" if (ifname and ip_addr) else "disconnected"
+    connected = bool(ifname and ip_addr)
+    profile = ""
+    address = ip_addr
+    interface = ifname
     try:
-        res = subprocess.run(["forticlient", "vpn", "status"], capture_output=True, text=True, timeout=5)
+        res = subprocess.run(["forticlient", "vpn", "status"], capture_output=True, text=True, timeout=3)
         lines = [l.strip() for l in res.stdout.splitlines()]
-        state = "disconnected"
-        connected = False
-        profile = ""
-        address = ""
         for line in lines:
             if line.startswith("Status:"):
                 st = line.split(":", 1)[1].strip().lower()
@@ -271,57 +288,53 @@ def forti_status():
                     state = "connected"
                     connected = True
                 elif "connecting" in st or "re-connecting" in st or "xauth" in st:
-                    state = "connecting"
+                    if not connected:
+                        state = "connecting"
                 elif "not running" in st or "disconnected" in st:
-                    state = "disconnected"
+                    if not connected:
+                        state = "disconnected"
                 else:
-                    state = "unknown"
+                    if not connected:
+                        state = "unknown"
             elif line.startswith("VPN name:"):
                 profile = line.split(":", 1)[1].strip()
-            elif line.startswith("IP:"):
+            elif line.startswith("IP:") and not address:
                 address = line.split(":", 1)[1].strip()
-        interface = ""
-        if connected:
-            try:
-                ip_res = subprocess.run([require("ip"), "-j", "link", "show"], capture_output=True, text=True, timeout=3)
-                if ip_res.returncode == 0:
-                    links = json.loads(ip_res.stdout)
-                    for link in links:
-                        if link.get("ifname", "").startswith("fctvpn"):
-                            interface = link["ifname"]
-                            break
-            except Exception:
-                pass
-        error = ""
-        password_req = ""
-        if state == "connected":
-            try:
-                FORTI_ERROR_FILE.unlink(missing_ok=True)
-            except Exception:
-                pass
-        elif FORTI_ERROR_FILE.exists():
-            try:
-                raw_err = FORTI_ERROR_FILE.read_text().strip()
-                FORTI_ERROR_FILE.unlink(missing_ok=True)
-                if raw_err.startswith("PASSWORD_REQUIRED:"):
-                    password_req = raw_err.split(":", 1)[1].strip()
-                else:
-                    error = raw_err
-            except Exception:
-                pass
-        return {
-            "installed": True,
-            "state": state,
-            "connected": connected,
-            "profile": profile,
-            "interface": interface,
-            "address": address,
-            "error": error,
-            "passwordRequired": password_req,
-            "saved": get_forti_saved()
-        }
     except Exception:
-        return {"installed": True, "state": "unknown", "connected": False, "profile": "", "interface": "", "address": "", "error": "", "passwordRequired": "", "saved": {}}
+        pass
+
+    if connected and not profile:
+        profiles = forti_list()
+        profile = profiles[0] if len(profiles) == 1 else "FortiClient"
+
+    error = ""
+    password_req = ""
+    if state == "connected":
+        try:
+            FORTI_ERROR_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+    elif FORTI_ERROR_FILE.exists():
+        try:
+            raw_err = FORTI_ERROR_FILE.read_text().strip()
+            FORTI_ERROR_FILE.unlink(missing_ok=True)
+            if raw_err.startswith("PASSWORD_REQUIRED:"):
+                password_req = raw_err.split(":", 1)[1].strip()
+            else:
+                error = raw_err
+        except Exception:
+            pass
+    return {
+        "installed": True,
+        "state": state,
+        "connected": connected,
+        "profile": profile,
+        "interface": interface,
+        "address": address,
+        "error": error,
+        "passwordRequired": password_req,
+        "saved": get_forti_saved()
+    }
 
 def active_physical_device():
     try:
@@ -467,7 +480,6 @@ def forti_connect_pty(name, password):
         sent_pass = False
         start = time.time()
         connected = False
-        last_check = 0
         try:
             while time.time() - start < 35:
                 r, _, _ = select.select([master], [], [], 0.3)
@@ -488,25 +500,21 @@ def forti_connect_pty(name, password):
 
                 if b"Notification: Login failed" in buf or b"Notification: Login canceled" in buf or b"Insufficient credential" in buf:
                     break
+                ifname, ip_addr = get_fctvpn_interface()
+                if ifname and ip_addr:
+                    connected = True
+                    break
                 if b"Status: Connected" in buf or b"FCT_VPN_CONNECTED" in buf or b"Tunnel is up" in buf:
                     connected = True
                     break
-
-                now = time.time()
-                if sent_pass and (now - last_check > 1.0):
-                    last_check = now
-                    st = forti_status()
-                    if st.get("connected"):
-                        connected = True
-                        break
         finally:
             try:
                 os.close(master)
             except Exception:
                 pass
             if not connected:
-                st = forti_status()
-                if st.get("connected"):
+                ifname, ip_addr = get_fctvpn_interface()
+                if ifname and ip_addr:
                     connected = True
                 else:
                     try:
@@ -514,7 +522,7 @@ def forti_connect_pty(name, password):
                     except Exception:
                         pass
             try:
-                os.waitpid(pid, 0)
+                os.waitpid(pid, os.WNOHANG)
             except Exception:
                 pass
         return buf.decode(errors="replace")
