@@ -145,11 +145,16 @@ head -n 1 client-key.pem  # expect: -----BEGIN ENCRYPTED PRIVATE KEY-----
 
 Create the profile from the `VpnSettings.xml` values (gateway, routes,
 client address pool, DNS). Replace the placeholders with your bundle's
-values; the key stays encrypted and its password is never stored:
+values; the key stays encrypted and its password is never stored. Two
+settings are load-bearing against Azure P2S gateways: `tls-identity` must
+carry the client certificate's common name (without it the gateway answers
+the TLS handshake with `access denied`), and `require-mppe` must be `no`
+(the gateway refuses MPPE; the Windows bundle sets EncryptionLevel
+Optional):
 
 ```bash
 nmcli connection add type vpn con-name HIRO-GW ifname '*' vpn-type sstp \
-  +vpn.data "gateway = <VpnServer>, connection-type = tls, tls-user-cert = $HOME/VPN/hiro/client-cert.pem, tls-user-key = $HOME/VPN/hiro/client-key.pem, tls-user-key-secret-flags = 2, tls-ca-cert = $HOME/VPN/hiro/server-root.pem, ca-cert = $HOME/VPN/hiro/server-root.pem, ignore-cert-warn = no, tls-ext = yes, require-mppe = yes, refuse-eap = no, refuse-pap = yes, refuse-chap = yes, refuse-mschap = yes, refuse-mschapv2 = yes, nobsdcomp = yes, nodeflate = yes" \
+  +vpn.data "gateway = <VpnServer>, connection-type = tls, tls-user-cert = $HOME/VPN/hiro/client-cert.pem, tls-user-key = $HOME/VPN/hiro/client-key.pem, tls-user-key-secret-flags = 2, tls-identity = <client-cert-CN>, tls-ca-cert = $HOME/VPN/hiro/server-root.pem, ca-cert = $HOME/VPN/hiro/server-root.pem, ignore-cert-warn = no, tls-ext = yes, require-mppe = no, refuse-eap = no, refuse-pap = yes, refuse-chap = yes, refuse-mschap = yes, refuse-mschapv2 = yes, nobsdcomp = yes, nodeflate = yes" \
   ipv4.dns <CustomDnsServers> ipv4.ignore-auto-dns yes ipv4.never-default yes ipv6.method disabled
 # Add each <Routes> entry plus the <VpnClientAddressPool> as its own route:
 nmcli connection modify HIRO-GW +ipv4.routes "<route-1>" +ipv4.routes "<route-2>"
