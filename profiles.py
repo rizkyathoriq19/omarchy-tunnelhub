@@ -281,13 +281,13 @@ def forti_status():
         elif FORTI_ERROR_FILE.exists():
             try:
                 raw_err = FORTI_ERROR_FILE.read_text().strip()
+                FORTI_ERROR_FILE.unlink(missing_ok=True)
                 if raw_err.startswith("PASSWORD_REQUIRED:"):
                     password_req = raw_err.split(":", 1)[1].strip()
                 else:
                     error = raw_err
             except Exception:
                 pass
-        saved = {p: forti_has_password(p) for p in forti_list()}
         return {
             "installed": True,
             "state": state,
@@ -296,11 +296,10 @@ def forti_status():
             "interface": interface,
             "address": address,
             "error": error,
-            "passwordRequired": password_req,
-            "saved": saved
+            "passwordRequired": password_req
         }
     except Exception:
-        return {"installed": True, "state": "unknown", "connected": False, "profile": "", "interface": "", "address": "", "error": "", "passwordRequired": "", "saved": {}}
+        return {"installed": True, "state": "unknown", "connected": False, "profile": "", "interface": "", "address": "", "error": "", "passwordRequired": ""}
 
 
 def forti_connect_pty(name, password):
@@ -319,7 +318,8 @@ def forti_connect_pty(name, password):
     else:
         os.close(slave)
         buf = b""
-        state = 0
+        sent_pass = False
+        confirmed = False
         start = time.time()
         connected = False
         try:
@@ -334,13 +334,13 @@ def forti_connect_pty(name, password):
                 if not chunk:
                     break
                 buf += chunk
-                if state == 0 and b"Password:" in buf:
+                if not sent_pass and b"Password:" in buf:
                     os.write(master, (password + "\n").encode())
-                    state = 1
-                elif state == 1 and b"Confirm (y/n)" in buf:
+                    sent_pass = True
+                if not confirmed and b"Confirm (y/n)" in buf:
                     os.write(master, b"y\n")
-                    state = 2
-                elif state >= 1 and (b"Status: Connected" in buf or b"Notification:" in buf or b"Status: Disconnected" in buf):
+                    confirmed = True
+                if b"Status: Connected" in buf or b"Status: Disconnected" in buf or b"Notification: Login failed" in buf or b"Notification: Login canceled" in buf:
                     if b"Status: Connected" in buf:
                         connected = True
                     time.sleep(0.5)
@@ -408,9 +408,8 @@ def forti_connect_with_password(name, password):
         FORTI_ERROR_FILE.unlink(missing_ok=True)
     except Exception:
         pass
-    env = dict(os.environ, AIRZY_FORTI_PASS=password)
     p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "bg-connect-forti-pass", name],
-                         stdin=subprocess.PIPE, start_new_session=True, env=env,
+                         stdin=subprocess.PIPE, start_new_session=True,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         p.stdin.write(password.encode() + b"\n")
@@ -492,7 +491,7 @@ def form_forti():
         "--add-entry=Remote Gateway (Host/IP)",
         "--add-entry=Port (Default: 443)",
         "--add-entry=Username"
-    ], capture_output=True, text=True)
+    ], capture_output=True, text=True, timeout=60)
     if picker.returncode == 1:
         return {"cancelled": True}
     if picker.returncode:
@@ -806,17 +805,19 @@ def main():
         return forti_delete(sys.argv[2])
     if action == "form-forti":
         return form_forti()
+    if action == "clear-forti-auth":
+        try:
+            FORTI_ERROR_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return {"cleared": True}
     if action == "connect-forti-pass":
         name = sys.argv[2]
-        password = os.environ.get("AIRZY_FORTI_PASS", "")
-        if not password and not sys.stdin.isatty():
-            password = sys.stdin.readline().rstrip("\r\n")
+        password = sys.stdin.readline().rstrip("\r\n") if not sys.stdin.isatty() else ""
         return forti_connect_with_password(name, password)
     if action == "bg-connect-forti-pass":
         name = sys.argv[2]
-        password = os.environ.get("AIRZY_FORTI_PASS", "")
-        if not password and not sys.stdin.isatty():
-            password = sys.stdin.readline().rstrip("\r\n")
+        password = sys.stdin.readline().rstrip("\r\n") if not sys.stdin.isatty() else ""
         forti_connect_pass_bg(name, password)
         return {"done": True}
     if action == "list":

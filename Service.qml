@@ -32,7 +32,10 @@ Item {
     else { _nmAttemptCancelled = true; certificateProcess.write(ident + "\n") }
   }
   function cancelAuth() {
-    fortiRequest = ""
+    if (fortiRequest) {
+      fortiRequest = ""
+      profileAction("clear-forti-auth")
+    }
     if (certificateProcess.running) { _nmAttemptCancelled = true; certificateProcess.write("CANCEL\n") }
     certificateRequest = ""
     cancelPermission()
@@ -157,12 +160,16 @@ Item {
   function toggleForti(name) {
     if (forti.connected && forti.profile === name) {
       profileAction("disconnect-forti")
-    } else if (fortiSaved[name] !== true) {
-      root.fortiRequest = name
-      lastMessage = ""
-      lastError = ""
     } else {
-      profileAction("connect-forti", name)
+      if (azure.connected || azureOperation.running) profileAction("disconnect")
+      else if (nmActive) disconnectNm()
+      if (fortiSaved[name] !== true) {
+        root.fortiRequest = name
+        lastMessage = ""
+        lastError = ""
+      } else {
+        profileAction("connect-forti", name)
+      }
     }
   }
   function deleteForti(name) {
@@ -184,11 +191,6 @@ Item {
       lastError = ""
       pendingAction = action
       lastMessage = (action === "launch" || action === "connect-forti" || action === "connect-forti-pass") ? "Connecting…" : "Disconnecting…"
-    }
-    if (input !== undefined && input !== "") {
-      importProcess.environment = { "AIRZY_FORTI_PASS": input }
-    } else {
-      importProcess.environment = {}
     }
     importProcess.command = ["/usr/bin/python3", decodeURIComponent(Qt.resolvedUrl("profiles.py").toString().replace(/^file:\/\//, "")), action]
     if (path !== undefined) importProcess.command = importProcess.command.concat([path])
