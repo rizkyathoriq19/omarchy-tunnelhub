@@ -385,9 +385,9 @@ def forti_connect_pass_bg(name, password):
             except Exception:
                 pass
         elif "Insufficient credential" in pty_out or "Login failed" in pty_out:
-            FORTI_ERROR_FILE.write_text("Password salah atau ditolak oleh server VPN.")
+            FORTI_ERROR_FILE.write_text("Incorrect password or authentication rejected by VPN server.")
         elif "Login canceled" in pty_out:
-            FORTI_ERROR_FILE.write_text("Koneksi dibatalkan oleh FortiClient.")
+            FORTI_ERROR_FILE.write_text("Connection cancelled by FortiClient.")
         else:
             for line in pty_out.splitlines():
                 if "Notification:" in line:
@@ -429,7 +429,7 @@ def forti_connect_bg(name):
         if "Insufficient credential" in stdout:
             FORTI_ERROR_FILE.write_text(f"PASSWORD_REQUIRED:{name}")
         elif "Login canceled" in stdout:
-            FORTI_ERROR_FILE.write_text("Koneksi dibatalkan oleh FortiClient.")
+            FORTI_ERROR_FILE.write_text("Connection cancelled by FortiClient.")
         elif "Status: Connected" not in stdout:
             for line in stdout.splitlines():
                 if "Notification:" in line:

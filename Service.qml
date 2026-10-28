@@ -103,6 +103,9 @@ Item {
         var result = JSON.parse(azureOutput.text)
         if (result.forti !== undefined) {
           root.forti = result.forti
+          if (root.forti.connected) {
+            root.clearResolvedMessage()
+          }
           if (result.forti.saved !== undefined) {
             root.fortiSaved = result.forti.saved
           }
@@ -134,9 +137,13 @@ Item {
   property string pendingAction: ""
   function clearResolvedMessage() {
     if ((pendingAction === "launch" && azure.connected) ||
-        (pendingAction === "connect-forti" && forti.connected) ||
+        ((pendingAction === "connect-forti" || pendingAction === "connect-forti-pass") && forti.connected) ||
         (pendingAction === "disconnect-forti" && !forti.connected) ||
         (pendingAction === "disconnect" && azure.state === "disconnected" && azureOperationKnown && !azureOperation.running && !azureOperation.stopping)) {
+      lastMessage = ""
+      pendingAction = ""
+    }
+    if (forti.connected && (lastMessage.indexOf("Connecting to FortiClient") !== -1 || pendingAction === "connect-forti" || pendingAction === "connect-forti-pass")) {
       lastMessage = ""
       pendingAction = ""
     }
@@ -167,7 +174,7 @@ Item {
   function rowAction(state) {
     return ["connected", "connecting", "reconnecting"].indexOf(state) !== -1 ? "Disconnect" : "Connect"
   }
-  Timer { interval: 4000; running: root.lastMessage !== "" && root.pendingAction === ""; onTriggered: root.lastMessage = "" }
+  Timer { interval: 3000; running: root.lastMessage !== ""; onTriggered: { root.lastMessage = ""; root.pendingAction = "" } }
   readonly property bool importing: importProcess.running
 
   function profileAction(action, path, input) {
@@ -263,7 +270,7 @@ Item {
   property string _ipOutput: ""
   property string _actionOutput: ""
 
-  readonly property bool active: azure.connected || (nmStateKnown && nmUuid !== "")
+  readonly property bool active: azure.connected || forti.connected || (nmStateKnown && nmUuid !== "")
   readonly property int refreshIntervalSec: intSetting(
     "refreshIntervalSec",
     10,
