@@ -1,6 +1,6 @@
 # TunnelHub — Omarchy VPN Widget
 
-![TunnelHub preview](preview.png)
+<img src="preview.png" width="406" alt="TunnelHub preview">
 
 ## Install / remove the plugin
 
@@ -108,6 +108,27 @@ passwords. For other authentication types or persistent credentials, use a
 trusted native NetworkManager editor/secret agent and its storage policy. Do
 not put passwords in shell arguments or manually copy an askpass file into
 plugin state.
+
+## FortiClient SSL-VPN
+
+The panel lists FortiClient CLI profiles (`forticlient vpn list`) and manages connections through the native CLI. The plugin owns the Forti password; it is stored in GNOME Keyring through `secret-tool` under the credential identity **profile name + gateway host + username**. The plugin always connects with `forticlient vpn connect NAME -p` and never passes `-s`; FortiClient's own Save Password flag is left untouched and ignored. No password is written to JSON, plugin state files, argv, environment variables, or logs.
+
+On connect, the widget tries the saved credential first. If FortiClient explicitly rejects it, the panel asks for a new password; the new password replaces the saved one only after a native `fctvpn` interface with an IPv4 address is confirmed. The first connection after this change prompts once, then saves after success. If GNOME Keyring is unavailable, the widget fails closed: it prompts for every connection, uses the password only for that attempt, and reports that it could not be saved. There is no plaintext or encrypted JSON fallback. Deleting a Forti profile clears its keyring item first; if the item cannot be cleared, deletion fails closed so no orphan secret remains. The plugin never stores the system/sudo password.
+
+Each connect attempt has a 90-second deadline. The panel reports not connected, a fixed timeout error, and a **Clean up** action instead of leaving "Connecting" indefinitely; cleanup runs the native disconnect and does not auto-disconnect a live tunnel. Disconnect runs in a detached PTY helper: it answers only the native `Confirmation Required` / `Confirm (y/n)` prompt, never asks for a password, and has a 30-second deadline. Unknown prompts, including password, FortiToken, new-password, or certificate prompts, stop the helper without sending a secret. New Forti profiles are created with prompt authentication; the plugin does not enable FortiClient Save Password.
+
+Check whether a credential is stored without printing the secret:
+
+```bash
+cd ~/.config/omarchy/plugins/airzy.vpn
+python3 profiles.py credential-status evans
+```
+
+The result contains `saved`, `length`, and `reason`; it never includes the password. If `saved` is false, the next connect prompts. If it is true but the panel says the saved password was rejected, the stored password is stale; entering a new password replaces it only after a successful connection.
+
+Disconnect does not invoke sudo or `resolvectl flush-caches`. It waits briefly for native FortiClient cleanup, then reapplies the physical NetworkManager connection so DHCP routes and DNS replace FortiClient values.
+
+Requirements: `forticlient` CLI (observed with 7.4.3.5411), `secret-tool`, and an available GNOME Keyring for persistent Forti credentials. The exact native prompt sequence for an active disconnect and PTY password prompting still require live UAT; this section does not claim live connectivity evidence.
 
 ## SSTP VPN with certificate authentication (EAP-TLS)
 

@@ -357,7 +357,7 @@ Panel {
               }
               Text {
                 width: parent.width
-                text: vpn.certificatePrompt ? "Enter the password that unlocks your VPN certificate/private key, not your system password. Cancel stops this connection attempt." : (vpn.fortiPrompt ? ("Enter password for FortiClient profile '" + vpn.fortiRequest + "'. It will be saved securely for future connections.") : "Enter your system password for sudo. Cancel denies this request.")
+                text: vpn.certificatePrompt ? "Enter the password that unlocks your VPN certificate/private key, not your system password. Cancel stops this connection attempt." : (vpn.fortiPrompt ? vpn.fortiPromptDescription() : "Enter your system password for sudo. Cancel denies this request.")
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -967,6 +967,26 @@ Panel {
 
             wrapMode:
               Text.WordWrap
+          }
+
+          Text {
+            width: parent.width
+            visible: vpn.forti.warning !== ""
+            text: vpn.forti.warning
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
+          Button {
+            width: parent.width
+            visible: vpn.forti.cleanupRequired && !vpn.authRequest
+            text: "Clean up stale FortiClient state"
+            Accessible.role: Accessible.Button
+            Accessible.name: "Clean up stale FortiClient state"
+            Accessible.onPressAction: clicked()
+            onClicked: vpn.disconnectForti()
           }
 
           Text {

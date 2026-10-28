@@ -11,6 +11,7 @@ Item {
   property string permissionRequest: ""
   property string certificateRequest: ""
   property string fortiRequest: ""
+  property string fortiRequestReason: ""
   readonly property string authRequest: fortiRequest || certificateRequest || permissionRequest
   readonly property bool certificatePrompt: certificateRequest !== ""
   readonly property bool fortiPrompt: fortiRequest !== ""
@@ -18,6 +19,7 @@ Item {
     if (fortiRequest) {
       var name = fortiRequest
       fortiRequest = ""
+      fortiRequestReason = ""
       if (value && value.length > 0) {
         profileAction("connect-forti-pass", name, value)
       }
@@ -34,6 +36,7 @@ Item {
   function cancelAuth() {
     if (fortiRequest) {
       fortiRequest = ""
+      fortiRequestReason = ""
       profileAction("clear-forti-auth")
     }
     if (certificateProcess.running) { _nmAttemptCancelled = true; certificateProcess.write("CANCEL\n") }
@@ -70,13 +73,13 @@ Item {
   property var profiles: []
   property var azureProfiles: []
   property var fortiProfiles: []
-  property var fortiSaved: ({})
+  property string fortiSwitchTarget: ""
   property var azure: ({state: "unknown", connected: false, path: "", interface: "", address: ""})
-  property var forti: ({installed: false, state: "disconnected", connected: false, profile: "", interface: "", address: ""})
+  property var forti: ({installed: false, state: "disconnected", connected: false, profile: "", interface: "", address: "", error: "", passwordRequired: "", passwordReason: "", cleanupRequired: false, warning: "", attempt: {}})
   property var azureOperation: ({known: false, running: null, stopping: null, error: ""})
   readonly property bool azureOperationKnown: azureOperation.known === true && typeof azureOperation.running === "boolean" && typeof azureOperation.stopping === "boolean"
   readonly property bool azurePending: azureOperation.running === true && !azure.connected
-  readonly property bool fortiPending: (pendingAction === "connect-forti" || pendingAction === "connect-forti-pass") && !forti.connected
+  readonly property bool fortiPending: ["connect-forti", "connect-forti-pass", "disconnect-forti"].indexOf(pendingAction) !== -1
   readonly property bool nmActive: nmStateKnown && nmUuid !== ""
   readonly property string azureDisplayState: azureOperation.stopping ? "disconnecting" : (azurePending ? "connecting" : azure.state)
   readonly property string activeProfile: azure.connected ? (azure.path ? azure.path.split("/").pop() : "VPN") : (forti.connected ? forti.profile : nmProfile)
@@ -84,12 +87,27 @@ Item {
   readonly property string activeUuid: azure.connected ? "" : (forti.connected ? "" : nmUuid)
   readonly property string tunnelIp: azure.connected ? azure.address : (forti.connected ? forti.address : nmTunnelIp)
   readonly property string interfaceName: azure.connected ? azure.interface : (forti.connected ? forti.interface : nmInterface)
-  readonly property string statusTitle: active ? "VPN Connected" : (azureDisplayState === "connecting" || forti.state === "connecting" || (certificateProcess.running && !_nmAttemptCancelled) ? "VPN Connecting" : (azureDisplayState === "disconnecting" || (certificateProcess.running && _nmAttemptCancelled) ? "VPN Disconnecting" : (azure.state === "unknown" || !azureOperationKnown || !nmStateKnown ? "VPN Status Unknown" : "VPN Disconnected")))
+  readonly property string statusTitle: active ? "VPN Connected" : (azureDisplayState === "connecting" || forti.state === "connecting" || (certificateProcess.running && !_nmAttemptCancelled) ? "VPN Connecting" : (azureDisplayState === "disconnecting" || forti.state === "disconnecting" || pendingAction === "disconnect-forti" || (certificateProcess.running && _nmAttemptCancelled) ? "VPN Disconnecting" : (azure.state === "unknown" || !azureOperationKnown || !nmStateKnown ? "VPN Status Unknown" : "VPN Disconnected")))
   readonly property int activeCount: (azure.connected ? 1 : 0) + (forti.connected ? 1 : 0) + (nmStateKnown ? _nmActiveUuids.length : 0)
   readonly property string statusDescription: activeCount > 1 ? activeCount + " connections active" : (active ? "Connection active" : "")
   function fortiRowStatus(name) {
-    if (forti.profile === name) return forti.state
+    if (forti.attempt && forti.attempt.profile === name && forti.attempt.phase === "disconnecting") return "disconnecting"
+    if (forti.connected && forti.profile === name) return "connected"
+    if (forti.attempt && forti.attempt.profile === name) {
+      if (forti.cleanupRequired) return "cleanup required"
+      if (forti.attempt.phase === "failed") return "failed"
+      if (forti.attempt.phase === "connecting" || forti.attempt.phase === "disconnecting") return forti.attempt.phase
+    }
     return "disconnected"
+  }
+  function fortiPromptDescription() {
+    if (fortiRequestReason === "auth-rejected")
+      return "Saved password for '" + fortiRequest + "' was rejected. Enter a new password; it will replace the saved one after a successful connection."
+    if (fortiRequestReason === "keyring-unavailable")
+      return "GNOME Keyring is unavailable. Enter password for '" + fortiRequest + "'; it will be used only for this connection."
+    if (fortiRequestReason === "identity-unavailable")
+      return "Saved password identity is unavailable. Enter password for '" + fortiRequest + "' for this connection only."
+    return "Enter password for '" + fortiRequest + "'. It will be saved after a successful connection."
   }
   function azureRowStatus(path) {
     if (azure.path === path) return azureOperation.stopping ? "disconnecting" : (!azureOperationKnown && azure.state === "disconnected" ? "unknown" : azure.state)
@@ -98,6 +116,12 @@ Item {
   }
   function pollAzure() {
     if (!azureProcess.running) azureProcess.running = true
+  }
+  Timer {
+    interval: 2000
+    repeat: true
+    running: root.fortiPending || root.forti.state === "connecting" || root.forti.state === "disconnecting" || root.forti.cleanupRequired
+    onTriggered: root.pollAzure()
   }
   Process {
     id: azureProcess
@@ -117,18 +141,24 @@ Item {
           if (root.forti.connected) {
             root.clearResolvedMessage()
           }
-          if (result.forti.saved !== undefined) {
-            root.fortiSaved = result.forti.saved
-          }
-          if (result.forti.passwordRequired) {
-            root.fortiRequest = result.forti.passwordRequired
+          if (root.forti.passwordRequired) {
+            root.fortiRequest = root.forti.passwordRequired
+            root.fortiRequestReason = root.forti.passwordReason || ""
             root.lastError = ""
             root.lastMessage = ""
             root.pendingAction = ""
-          } else if (result.forti.error) {
-            root.lastError = result.forti.error
+          } else if (root.forti.error) {
+            root.lastError = root.forti.error
             root.lastMessage = ""
             root.pendingAction = ""
+          }
+          if (root.fortiSwitchTarget !== "" && !root.forti.connected && !root.forti.cleanupRequired &&
+              !root.fortiPending && root.forti.state === "disconnected") {
+            var switchTarget = root.fortiSwitchTarget
+            root.fortiSwitchTarget = ""
+            root.profileAction("connect-forti", switchTarget)
+          } else if (root.forti.cleanupRequired || root.forti.error) {
+            root.fortiSwitchTarget = ""
           }
         }
         if (root.azureOperation.error) {
@@ -149,7 +179,7 @@ Item {
   function clearResolvedMessage() {
     if ((pendingAction === "launch" && azure.connected) ||
         ((pendingAction === "connect-forti" || pendingAction === "connect-forti-pass") && forti.connected) ||
-        (pendingAction === "disconnect-forti" && !forti.connected) ||
+        (pendingAction === "disconnect-forti" && !forti.connected && !forti.cleanupRequired) ||
         (pendingAction === "disconnect" && azure.state === "disconnected" && azureOperationKnown && !azureOperation.running && !azureOperation.stopping)) {
       lastMessage = ""
       pendingAction = ""
@@ -184,6 +214,15 @@ Item {
       profileAction("disconnect-forti")
       return
     }
+    if (forti.connected) {
+      fortiSwitchTarget = name
+      profileAction("disconnect-forti")
+      return
+    }
+    if (forti.cleanupRequired) {
+      profileAction("disconnect-forti")
+      return
+    }
     if (azure.connected || azureOperation.running) {
       profileAction("disconnect")
       return
@@ -192,12 +231,8 @@ Item {
       disconnectNm()
       return
     }
-    if (fortiSaved[name] !== true) {
-      root.fortiRequest = name
-      lastMessage = "Enter password for '" + name + "' below"
-      lastError = ""
-      return
-    }
+    root.lastError = ""
+    root.fortiRequestReason = ""
     profileAction("connect-forti", name)
   }
   function deleteForti(name) {
@@ -210,7 +245,24 @@ Item {
     return ["connected", "connecting", "reconnecting"].indexOf(state) !== -1 ? "Disconnect" : "Connect"
   }
   Timer { interval: 4000; running: root.lastMessage !== "" && root.pendingAction === ""; onTriggered: root.lastMessage = "" }
-  Timer { interval: 40000; running: root.pendingAction !== ""; onTriggered: { root.pendingAction = ""; root.lastMessage = "" } }
+  Timer {
+    interval: 100000
+    running: root.pendingAction === "connect-forti" || root.pendingAction === "connect-forti-pass"
+    onTriggered: {
+      root.pendingAction = ""
+      root.lastMessage = ""
+      root.lastError = "FortiClient connection did not report a terminal state. Refresh and retry."
+    }
+  }
+  Timer {
+    interval: 35000
+    running: root.pendingAction === "disconnect-forti"
+    onTriggered: {
+      root.pendingAction = ""
+      root.lastMessage = ""
+      root.lastError = "FortiClient disconnection did not report a terminal state. Refresh and retry."
+    }
+  }
   readonly property bool importing: importProcess.running
 
   function profileAction(action, path, input) {
@@ -221,11 +273,7 @@ Item {
       pendingAction = action
       lastMessage = (action === "launch" || action === "connect-forti" || action === "connect-forti-pass") ? "Connecting…" : "Disconnecting…"
     }
-    if (input !== undefined && input !== "") {
-      importProcess.environment = { "AIRZY_FORTI_PASS": input }
-    } else {
-      importProcess.environment = {}
-    }
+    importProcess.environment = {}
     var cmd = ["/usr/bin/python3", decodeURIComponent(Qt.resolvedUrl("profiles.py").toString().replace(/^file:\/\//, "")), action]
     if (path !== undefined) cmd.push(path)
     importProcess.command = cmd
@@ -247,7 +295,16 @@ Item {
         if (result.cancelled) { root.pendingAction = ""; root.lastMessage = ""; return }
         if (result.azure !== undefined) root.azureProfiles = result.azure
         if (result.forti !== undefined) root.fortiProfiles = result.forti
-        if (result.fortiSaved !== undefined) root.fortiSaved = result.fortiSaved
+        if (result.passwordRequired) {
+          root.fortiRequest = result.passwordRequired
+          root.fortiRequestReason = result.reason || ""
+          root.lastError = ""
+          root.lastMessage = result.reason === "keyring-unavailable"
+            ? "GNOME Keyring is unavailable; enter the password for this connection only."
+            : "Enter the FortiClient password below."
+          root.pendingAction = ""
+          return
+        }
         if (result.error || exitCode !== 0) { root.lastError = result.error || "Profile helper failed."; root.lastMessage = ""; root.pendingAction = "" }
         else if (result.message) {
           root.lastError = ""
@@ -454,7 +511,7 @@ Item {
       profileAction("disconnect")
       return
     }
-    if (forti.connected) {
+    if (forti.connected || forti.cleanupRequired) {
       profileAction("disconnect-forti")
       return
     }
