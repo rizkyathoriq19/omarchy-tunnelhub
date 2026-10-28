@@ -105,6 +105,12 @@ Item {
     onExited: {
       try {
         var result = JSON.parse(azureOutput.text)
+        if (result.operation !== undefined) {
+          root.azureOperation = result.operation
+        }
+        if (result.state !== undefined) {
+          root.azure = result
+        }
         if (result.forti !== undefined) {
           root.forti = result.forti
           if (root.forti.connected) {

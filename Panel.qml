@@ -743,7 +743,6 @@ Panel {
                     ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.18)
                     : (root.cursorActive && root.profileIndex === vpn.profiles.length + index
                       ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08) : "transparent")
-                  enabled: !vpn.importing && !vpn.actionRunning && !vpn.azureOperation.stopping && (vpn.azure.path === modelData || vpn.azureOperation.path === modelData || (!vpn.azure.connected && vpn.azureOperationKnown && !vpn.azureOperation.running && (vpn.azure.state === "disconnected" || vpn.azure.state === "unknown")))
                   Row {
                     id: azureRow
                     anchors {
@@ -826,7 +825,6 @@ Panel {
                     ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.18)
                     : (root.cursorActive && root.profileIndex === vpn.profiles.length + vpn.azureProfiles.length + index
                       ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08) : "transparent")
-                  enabled: !vpn.importing && !vpn.actionRunning
                   Row {
                     id: fortiRow
                     anchors {
