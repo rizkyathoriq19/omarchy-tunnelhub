@@ -74,9 +74,25 @@ Item {
   property var azureProfiles: []
   property var fortiProfiles: []
   property string fortiSwitchTarget: ""
+  property string nmSwitchTarget: ""
+  property string azureSwitchTarget: ""
   property var azure: ({state: "unknown", connected: false, path: "", interface: "", address: ""})
   property var forti: ({installed: false, state: "disconnected", connected: false, profile: "", interface: "", address: "", error: "", passwordRequired: "", passwordReason: "", cleanupRequired: false, warning: "", attempt: {}})
   property var azureOperation: ({known: false, running: null, stopping: null, error: ""})
+  readonly property var fortiCertificate: {
+    var cert = forti && forti.certificateRequired
+    if (!cert || typeof cert !== "object") return null
+    if (typeof cert.host !== "string" || cert.host === "") return null
+    if (typeof cert.sha1 !== "string" || cert.sha1.length !== 40) return null
+    return cert
+  }
+  readonly property bool fortiCertificatePrompt: fortiCertificate !== null
+  readonly property string fortiCertificateProfile: fortiCertificate ? (forti.profile || (forti.attempt ? forti.attempt.profile : "") || "") : ""
+  readonly property string fortiCertificateHost: fortiCertificate ? fortiCertificate.host : ""
+  readonly property string fortiCertificateFingerprint: {
+    if (!fortiCertificate) return ""
+    return String(fortiCertificate.sha1).replace(/(.{2})(?=.)/g, "$1:")
+  }
   readonly property bool azureOperationKnown: azureOperation.known === true && typeof azureOperation.running === "boolean" && typeof azureOperation.stopping === "boolean"
   readonly property bool azurePending: azureOperation.running === true && !azure.connected
   readonly property bool fortiPending: ["connect-forti", "connect-forti-pass", "disconnect-forti"].indexOf(pendingAction) !== -1
@@ -120,7 +136,7 @@ Item {
   Timer {
     interval: 2000
     repeat: true
-    running: root.fortiPending || root.forti.state === "connecting" || root.forti.state === "disconnecting" || root.forti.cleanupRequired
+    running: root.fortiPending || root.forti.state === "connecting" || root.forti.state === "disconnecting" || root.forti.cleanupRequired || root.fortiSwitchTarget !== "" || root.nmSwitchTarget !== "" || root.azureSwitchTarget !== ""
     onTriggered: root.pollAzure()
   }
   Process {
@@ -147,6 +163,10 @@ Item {
             root.lastError = ""
             root.lastMessage = ""
             root.pendingAction = ""
+          } else if (root.forti.certificateRequired) {
+            root.lastError = ""
+            root.lastMessage = ""
+            root.pendingAction = ""
           } else if (root.forti.error) {
             root.lastError = root.forti.error
             root.lastMessage = ""
@@ -156,9 +176,27 @@ Item {
               !root.fortiPending && root.forti.state === "disconnected") {
             var switchTarget = root.fortiSwitchTarget
             root.fortiSwitchTarget = ""
+            root.pendingAction = ""
+            root.lastMessage = ""
             root.profileAction("connect-forti", switchTarget)
+          } else if (root.nmSwitchTarget !== "" && !root.forti.connected && !root.forti.cleanupRequired &&
+                     !root.fortiPending && root.forti.state === "disconnected") {
+            var targetUuid = root.nmSwitchTarget
+            root.nmSwitchTarget = ""
+            root.pendingAction = ""
+            root.lastMessage = ""
+            root.connectProfile(targetUuid)
+          } else if (root.azureSwitchTarget !== "" && !root.forti.connected && !root.forti.cleanupRequired &&
+                     !root.fortiPending && root.forti.state === "disconnected") {
+            var targetPath = root.azureSwitchTarget
+            root.azureSwitchTarget = ""
+            root.pendingAction = ""
+            root.lastMessage = ""
+            root.profileAction("launch", targetPath)
           } else if (root.forti.cleanupRequired || root.forti.error) {
             root.fortiSwitchTarget = ""
+            root.nmSwitchTarget = ""
+            root.azureSwitchTarget = ""
           }
         }
         if (root.azureOperation.error) {
@@ -200,6 +238,7 @@ Item {
       return
     }
     if (forti.connected) {
+      azureSwitchTarget = path
       profileAction("disconnect-forti")
       return
     }
@@ -240,6 +279,45 @@ Item {
   }
   function disconnectForti() {
     profileAction("disconnect-forti")
+  }
+  function approveFortiCertificate() {
+    var cert = fortiCertificate
+    var name = fortiCertificateProfile
+    if (!cert || name === "" || certificateApprove.running) return
+    lastError = ""
+    certificateApprove.command = [
+      "/usr/bin/python3",
+      decodeURIComponent(Qt.resolvedUrl("profiles.py").toString().replace(/^file:\/\//, "")),
+      "approve-forti-cert", name, cert.host, cert.sha1
+    ]
+    certificateApprove.running = true
+  }
+  function cancelFortiCertificate() {
+    var cleared = {}
+    for (var key in forti) cleared[key] = forti[key]
+    cleared.certificateRequired = null
+    cleared.error = ""
+    forti = cleared
+    lastError = ""
+    profileAction("clear-forti-auth")
+    refresh()
+  }
+  Process {
+    id: certificateApprove
+    stdout: StdioCollector { id: certificateApproveOutput; waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) {
+      try {
+        var result = JSON.parse(certificateApproveOutput.text)
+        if (exitCode === 0 && result.approved === true) {
+          root.profileAction("connect-forti", result.profile)
+          return
+        }
+        root.lastError = result.error || "Could not pin the VPN certificate. Refresh and retry."
+      } catch (e) {
+        root.lastError = "Could not pin the VPN certificate. Refresh and retry."
+      }
+    }
   }
   function rowAction(state) {
     return ["connected", "connecting", "reconnecting"].indexOf(state) !== -1 ? "Disconnect" : "Connect"
@@ -294,7 +372,7 @@ Item {
         var result = JSON.parse(importOutput.text)
         if (result.cancelled) { root.pendingAction = ""; root.lastMessage = ""; return }
         if (result.azure !== undefined) root.azureProfiles = result.azure
-        if (result.forti !== undefined) root.fortiProfiles = result.forti
+        if (result.forti !== undefined && result.fortiOk !== false) root.fortiProfiles = result.forti
         if (result.passwordRequired) {
           root.fortiRequest = result.passwordRequired
           root.fortiRequestReason = result.reason || ""
@@ -337,6 +415,9 @@ Item {
       try {
         var result = JSON.parse(registryOutput.text)
         if (result.azure !== undefined) root.azureProfiles = result.azure
+        // Keep the Forti rows reconciled on every refresh; skip a failed read
+        // so a CLI hiccup cannot blank existing profiles.
+        if (result.forti !== undefined && result.fortiOk !== false) root.fortiProfiles = result.forti
       } catch (e) { /* keep last known list; next refresh retries */ }
     }
   }
@@ -556,6 +637,7 @@ Item {
       return
     }
     if (forti.connected) {
+      nmSwitchTarget = uuid
       profileAction("disconnect-forti")
       return
     }

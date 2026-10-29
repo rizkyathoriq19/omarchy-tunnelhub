@@ -216,26 +216,38 @@ def forti_installed():
     return shutil.which("forticlient") is not None
 
 
-def forti_list():
+def forti_list_result():
+    """Return (profiles, readable) so callers never mistake a CLI hiccup for "no profiles"."""
     if not forti_installed():
-        return []
-    try:
-        res = subprocess.run(["forticlient", "vpn", "list"], capture_output=True, text=True, timeout=5)
-        if res.returncode != 0:
-            return []
-        lines = res.stdout.splitlines()
-        profiles = []
-        in_vpns = False
-        for line in lines:
-            stripped = line.strip()
-            if "Personal VPNs:" in line or "VPNs:" in line:
-                in_vpns = True
-                continue
-            if in_vpns and stripped and not stripped.endswith(":"):
-                profiles.append(stripped)
-        return profiles
-    except Exception:
-        return []
+        return [], False
+    for _attempt in range(3):
+        try:
+            res = subprocess.run(["forticlient", "vpn", "list"], capture_output=True, text=True, timeout=5)
+        except Exception:
+            res = None
+        if res is not None and res.returncode == 0:
+            profiles = []
+            in_vpns = False
+            for line in res.stdout.splitlines():
+                stripped = line.strip()
+                if "Personal VPNs:" in line or "VPNs:" in line:
+                    in_vpns = True
+                    continue
+                if in_vpns and stripped and not stripped.endswith(":"):
+                    profiles.append(stripped)
+            if in_vpns:
+                return profiles, True
+        time.sleep(0.2)
+    return [], False
+
+
+def forti_list():
+    return forti_list_result()[0]
+
+
+def forti_profile_payload():
+    profiles, readable = forti_list_result()
+    return {"forti": profiles, "fortiOk": readable}
 
 
 FORTI_ATTEMPT_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "airzy.vpn-forti-attempt.json"
@@ -244,6 +256,74 @@ FORTI_CONNECT_TIMEOUT = 90
 FORTI_DISCONNECT_TIMEOUT = 30
 FORTI_KEYRING_TIMEOUT = 10
 FORTI_CONFIRM_LIMIT = 3
+FORTI_PIN_FILE = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "airzy.vpn/forti-pins.json"
+
+
+def forti_fingerprint_digits(value):
+    return re.sub(r"[^0-9A-F]", "", str(value).upper())
+
+
+def forti_pins_load():
+    try:
+        data = json.loads(FORTI_PIN_FILE.read_text())
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def forti_pin_get(name):
+    pin = forti_pins_load().get(name)
+    if not isinstance(pin, dict):
+        return None
+    host = pin.get("host")
+    sha1 = pin.get("sha1")
+    if not isinstance(host, str) or not isinstance(sha1, str) or not host:
+        return None
+    digits = forti_fingerprint_digits(sha1)
+    if len(digits) != 40:
+        return None
+    return {"host": host.lower(), "sha1": digits}
+
+
+def forti_pins_write(pins):
+    FORTI_PIN_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temp = tempfile.mkstemp(dir=FORTI_PIN_FILE.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            json.dump(pins, stream, indent=2)
+        os.replace(temp, FORTI_PIN_FILE)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def forti_pin_set(name, host, sha1):
+    host = (host or "").strip().lower()
+    digits = forti_fingerprint_digits(sha1)
+    if not host or len(host) > 255 or any(ord(c) < 32 or ord(c) == 127 for c in host):
+        raise ValueError("The certificate hostname is missing or invalid; nothing was pinned.")
+    if len(digits) != 40:
+        raise ValueError("The certificate fingerprint is not a SHA-1 digest; nothing was pinned.")
+    pins = forti_pins_load()
+    pins[name] = {"host": host, "sha1": digits}
+    forti_pins_write(pins)
+    return {"profile": name, "host": host, "sha1": digits}
+
+
+def forti_pin_clear(name):
+    pins = forti_pins_load()
+    if name not in pins:
+        return True
+    pins.pop(name, None)
+    try:
+        if pins:
+            forti_pins_write(pins)
+        else:
+            FORTI_PIN_FILE.unlink(missing_ok=True)
+    except Exception:
+        return False
+    return True
 
 
 def _forti_attempt_read():
@@ -314,10 +394,12 @@ def forti_attempt_update(record, **changes):
     return True
 
 
-def forti_attempt_finish(record, phase, reason="", error="", password_required="", cleanup_required=False, warning=""):
+def forti_attempt_finish(record, phase, reason="", error="", password_required="",
+                        cleanup_required=False, warning="", certificate=None):
     return forti_attempt_update(record, phase=phase, reason=reason, error=error,
                                 password_required=password_required,
-                                cleanup_required=cleanup_required, warning=warning)
+                                cleanup_required=cleanup_required, warning=warning,
+                                certificate=certificate)
 
 
 def forti_attempt_clear(record=None):
@@ -544,18 +626,24 @@ def merge_forti_status(native, attempt=None, now=None, helper_live=None):
     password_reason = ""
     cleanup = False
     warning = attempt.get("warning", "")
+    certificate = attempt.get("certificate")
+    if not isinstance(certificate, dict):
+        certificate = None
     state = "disconnected"
 
     if not native.get("installed", True):
         return {"installed": False, "state": "not_installed", "connected": False,
                 "profile": profile, "interface": "", "address": "",
                 "error": "", "passwordRequired": "", "passwordReason": "",
-                "cleanupRequired": False, "warning": "",
+                "cleanupRequired": False, "warning": "", "certificateRequired": None,
                 "attempt": {"phase": phase, "profile": attempt.get("profile", ""),
                             "deadline": deadline, "warning": "", "cleanupRequired": False}}
 
     if connected:
         state = "connected"
+        certificate = None
+        if phase == "failed":
+            phase = "connected"
     elif phase == "connecting":
         if live and now < deadline:
             state = "connecting"
@@ -579,6 +667,10 @@ def merge_forti_status(native, attempt=None, now=None, helper_live=None):
         password_required = attempt.get("password_required", "")
         password_reason = attempt.get("reason", "") if password_required else ""
         cleanup = bool(attempt.get("cleanup_required")) or native_state not in ("disconnected", "not_installed")
+        if attempt.get("reason") in ("certificate-untrusted", "certificate-mismatch"):
+            # The connect helper clears any leftover session itself, so a
+            # pending approval must not be blocked behind Clean up.
+            cleanup = False
     else:
         if native_state == "connecting":
             state = "unknown"
@@ -606,6 +698,7 @@ def merge_forti_status(native, attempt=None, now=None, helper_live=None):
         "passwordReason": password_reason,
         "cleanupRequired": cleanup,
         "warning": warning,
+        "certificateRequired": certificate if state == "failed" else None,
         "attempt": {"phase": phase, "profile": attempt.get("profile", ""),
                     "deadline": deadline, "warning": warning,
                     "cleanupRequired": cleanup},
@@ -719,19 +812,56 @@ def heal_network_on_connect(vpn_iface=None):
             pass
 
 
-def restore_network_on_disconnect():
-    # Reapply the physical connection so DHCP routes and DNS replace any
-    # FortiClient values. This does not invoke sudo or resolvectl flush-caches.
-    phys_dev, _ = active_physical_device()
-    if not phys_dev:
-        return
+def dns_resolves():
     try:
-        nmcli = require("nmcli")
-        subprocess.run([nmcli, "device", "reapply", phys_dev],
-                       capture_output=True, text=True, timeout=10)
+        res = subprocess.run(["getent", "hosts", "google.com"],
+                             capture_output=True, text=True, timeout=2)
     except Exception:
-        pass
+        return False
+    return res.returncode == 0
 
+
+def restore_network_on_disconnect():
+    # FortiClient replaces /etc/resolv.conf on connect and restores it from its
+    # own daemon on disconnect. Wait for that restore before re-asserting
+    # NetworkManager state, otherwise a stale VPN nameserver set survives.
+    backup_file = Path("/etc/resolv.conf.forticlient.backup")
+    wait_end = time.monotonic() + 5.0
+    while backup_file.exists() and time.monotonic() < wait_end:
+        time.sleep(0.1)
+
+    phys_dev, _ = active_physical_device()
+    if phys_dev:
+        try:
+            nmcli = require("nmcli")
+            # network-control is granted to active local sessions; this never prompts.
+            subprocess.run([nmcli, "device", "reapply", phys_dev],
+                           capture_output=True, text=True, timeout=10)
+        except Exception:
+            pass
+
+    end = time.monotonic() + 3.0
+    while time.monotonic() < end:
+        if dns_resolves():
+            return
+        time.sleep(0.2)
+
+    # FortiClient's own resolver restart shells out to /usr/sbin/service, which
+    # Arch does not ship, so resolution can keep pointing at VPN nameservers.
+    # Reapply the desktop DNS provider instead: those three names are NOPASSWD
+    # in Omarchy's sudoers and `sudo -n` can never open a password prompt.
+    provider = current_dns_provider()
+    if provider in ("DHCP", "Cloudflare", "Google"):
+        try:
+            subprocess.run(["sudo", "-n", "/usr/bin/omarchy-dns", provider],
+                           capture_output=True, text=True, timeout=10)
+        except Exception:
+            pass
+    end = time.monotonic() + 3.0
+    while time.monotonic() < end:
+        if dns_resolves():
+            return
+        time.sleep(0.2)
 
 STATE_FILE = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "airzy.vpn-runtime-state.json"
 
@@ -821,35 +951,102 @@ def _forti_replace_password_prompt(buf):
         buf[match.start():match.end()] = b"SENT_PASSWORD"
 
 
-def _forti_unknown_prompt(buf, allow_plain_password_prompt):
+def _forti_certificate_prompt(buf):
+    text = bytes(buf)
+    if b"Confirm (y/n)" not in text and b"Accept (y/n)" not in text:
+        return None
+    if b"untrusted server" not in text.lower() and b"X509 verify certificate failed" not in text:
+        return None
+    host = re.search(rb"(?mi)^[ \t]*Hostname:[ \t]*(\S+)[ \t]*\r?$", text)
+    fingerprint = re.search(rb"(?mi)^[ \t]*Fingerprint \(SHA1\):[ \t]*([0-9A-Fa-f: \t]+)", text)
+    return {
+        "host": host[1].decode(errors="replace").strip().lower() if host else "",
+        "sha1": forti_fingerprint_digits(fingerprint[1].decode(errors="replace")) if fingerprint else "",
+        "reason": "X509 verify certificate failed",
+    }
+
+
+def _forti_connect_unknown_prompt(buf, sent_password, cert_trusted=False):
     probe = bytes(buf).lower()
-    for marker in (b"confirm (y/n)", b"confirmation required",
-                   b"sent_password", b"confirmed"):
-        probe = probe.replace(marker, b"")
-    if allow_plain_password_prompt:
-        probe = probe.replace(b"please input password.", b"")
-    return any(word in probe for word in (b"password", b"token", b"confirm"))
+    probe = probe.replace(b"please input password.", b"")
+    probe = probe.replace(b"sent_password", b"")
+
+    if not sent_password:
+        match = re.search(rb"(?m)^[ \t]*password:[ \t]*\r?$", probe)
+        if match is not None:
+            probe = probe[:match.start()] + probe[match.end():]
+
+    if not cert_trusted and any(m in probe for m in (b"confirm", b"accept", b"certificate",
+                                                     b"fingerprint", b"untrusted", b"x509")):
+        return "FortiClient requested an untrusted server certificate confirmation or unsupported prompt."
+
+    if any(m in probe for m in (b"password", b"token")):
+        return "FortiClient requested an unsupported authentication prompt."
+
+    return ""
 
 
-def _forti_answer_prompts(buf, master, password, sent_password, confirmations):
-    while b"Confirm (y/n)" in buf and confirmations < FORTI_CONFIRM_LIMIT:
-        if not _forti_write(master, b"y\n"):
-            return "FortiClient closed the connection while a confirmation was pending.", sent_password, confirmations
-        confirmations += 1
-        buf[:] = buf.replace(b"Confirm (y/n)", b"CONFIRMED", 1)
-    if confirmations >= FORTI_CONFIRM_LIMIT and b"Confirm (y/n)" in buf:
-        return "FortiClient requested too many confirmation prompts.", sent_password, confirmations
+def _forti_connect_prompts(buf, master, password, pin, state):
+    cert = _forti_certificate_prompt(buf)
+    if cert is not None:
+        if not cert["host"] or not cert["sha1"]:
+            return ("FortiClient requested an untrusted server certificate confirmation but did not report a usable hostname and SHA-1 fingerprint.",
+                    cert)
+        if pin and str(pin.get("host", "")).lower() == cert["host"] \
+                and forti_fingerprint_digits(pin.get("sha1", "")) == cert["sha1"]:
+            if not _forti_write(master, b"y\n"):
+                return "FortiClient closed the connection while a pinned certificate confirmation was pending.", None
+            state["cert_trusted"] = True
+            buf.clear()
+            return "", None
+        setting = ("does not match the fingerprint pinned for this profile" if pin
+                   else "is not pinned for this profile")
+        return (f"FortiClient reported an untrusted server certificate that {setting}. "
+                "Review the hostname and SHA-1 fingerprint, then approve it in the panel.", cert)
+
+    prompt_error = _forti_connect_unknown_prompt(buf, state["sent_password"], state["cert_trusted"])
+    if prompt_error:
+        return prompt_error, None
+
     if _forti_password_prompt(buf):
-        if password is not None and password and not sent_password:
+        if password and not state["sent_password"]:
             if not _forti_write(master, password + b"\n"):
-                return "FortiClient closed the connection while a password was pending.", sent_password, confirmations
-            sent_password = True
+                return "FortiClient closed the connection while a password was pending.", None
+            state["sent_password"] = True
             _forti_replace_password_prompt(buf)
         else:
-            return "FortiClient requested a password prompt that could not be answered safely.", sent_password, confirmations
-    if _forti_unknown_prompt(buf, password is not None):
-        return "FortiClient requested an unsupported authentication prompt.", sent_password, confirmations
-    return "", sent_password, confirmations
+            return "FortiClient requested a password prompt that could not be answered safely.", None
+
+    return "", None
+
+
+def _forti_disconnect_unknown_prompt(buf):
+    probe = bytes(buf).lower()
+    for marker in (b"confirm (y/n)", b"confirmation required", b"confirmed"):
+        probe = probe.replace(marker, b"")
+    if any(m in probe for m in (b"confirm", b"accept", b"certificate",
+                               b"fingerprint", b"untrusted", b"x509")):
+        return "FortiClient requested an unsupported confirmation or certificate prompt during disconnection."
+    if any(m in probe for m in (b"password", b"token")):
+        return "FortiClient requested an unsupported authentication prompt during disconnection."
+    return ""
+
+
+def _forti_disconnect_prompts(buf, master, confirmations):
+    prompt_error = _forti_disconnect_unknown_prompt(buf)
+    if prompt_error:
+        return prompt_error, confirmations
+
+    while b"Confirm (y/n)" in buf and confirmations < FORTI_CONFIRM_LIMIT:
+        if not _forti_write(master, b"y\n"):
+            return "FortiClient closed the connection while a confirmation was pending.", confirmations
+        confirmations += 1
+        buf[:] = buf.replace(b"Confirm (y/n)", b"CONFIRMED", 1)
+
+    if confirmations >= FORTI_CONFIRM_LIMIT and b"Confirm (y/n)" in buf:
+        return "FortiClient requested too many confirmation prompts.", confirmations
+
+    return "", confirmations
 
 
 def _forti_wait_child(pid, timeout):
@@ -897,18 +1094,21 @@ def forti_connect_pty(name, password, store=False):
                              error="No Forti password was available for this connection.")
         return
     record = forti_attempt_start(name, "connecting", FORTI_CONNECT_TIMEOUT)
+    pin = forti_pin_get(name)
     master, pid = _forti_pty_open(["forticlient", "vpn", "connect", name, "-p"])
     buf = bytearray()
-    sent_password = False
-    confirmations = 0
+    state = {"sent_password": False, "cert_trusted": False}
     connected = False
     auth_rejected = False
     cancelled = False
     unsupported = ""
+    certificate = None
     child_alive = True
     exited_early = False
-    last_poll = 0.0
+    restarted = False
+    password_timer = False
     deadline = record["deadline"]
+    connect_deadline = deadline
     try:
         while time.time() < deadline:
             if child_alive:
@@ -917,7 +1117,6 @@ def forti_connect_pty(name, password, store=False):
                     chunk = _forti_read(master)
                     if not chunk:
                         child_alive = False
-                        exited_early = True
                         try:
                             os.close(master)
                         except Exception:
@@ -926,45 +1125,82 @@ def forti_connect_pty(name, password, store=False):
                         buf.extend(chunk)
                         if len(buf) > 65536:
                             del buf[:-8192]
+                        if b"already running" in buf and not restarted:
+                            restarted = True
+                            if child_alive:
+                                _forti_stop_child(pid)
+                                child_alive = False
+                            try:
+                                os.close(master)
+                            except Exception:
+                                pass
+                            cleared = False
+                            for _attempt in range(2):
+                                _forti_disconnect_run(25)
+                                if forti_native_status().get("state") in ("disconnected", "not_installed"):
+                                    cleared = True
+                                    break
+                                time.sleep(1.0)
+                            if not cleared:
+                                unsupported = ("FortiClient kept a previous session running and did not disconnect it. "
+                                               "Use Clean up, then retry.")
+                                break
+                            master, pid = _forti_pty_open(["forticlient", "vpn", "connect", name, "-p"])
+                            buf = bytearray()
+                            state = {"sent_password": False, "cert_trusted": False}
+                            child_alive = True
+                            exited_early = False
+                            password_timer = False
+                            connect_deadline = deadline
+                            continue
                         if b"Insufficient credential" in buf or b"Login failed" in buf:
                             auth_rejected = True
                             break
                         if b"Login canceled" in buf:
                             cancelled = True
                             break
-                        prompt_error, sent_password, confirmations = _forti_answer_prompts(
-                            buf, master, password, sent_password, confirmations)
+                        prompt_error, cert = _forti_connect_prompts(buf, master, password, pin, state)
                         if prompt_error:
                             unsupported = prompt_error
+                            certificate = cert
                             break
+                        if state["sent_password"] and not password_timer:
+                            password_timer = True
+                            connect_deadline = time.monotonic() + 25.0
                 if child_alive:
                     try:
                         done, _ = os.waitpid(pid, os.WNOHANG)
                         if done == pid:
                             child_alive = False
-                            exited_early = True
+                            if not state["sent_password"]:
+                                exited_early = True
                             try:
                                 os.close(master)
                             except Exception:
                                 pass
                     except ChildProcessError:
                         child_alive = False
-                        exited_early = True
+                        if not state["sent_password"]:
+                            exited_early = True
 
-            now = time.monotonic()
-            if now - last_poll >= 1.0:
-                last_poll = now
-                ifname, ip_addr = get_fctvpn_interface()
-                if ifname and ip_addr:
-                    connected = True
-                    break
+            ifname, ip_addr = get_fctvpn_interface()
+            if ifname and ip_addr:
+                connected = True
+                break
+
+            native = forti_native_status()
+            if native.get("connected") and native.get("interface"):
+                connected = True
+                ifname = native.get("interface")
+                break
 
             if not child_alive:
-                native = forti_native_status()
-                if native.get("state") in ("disconnected", "not_installed"):
+                if not state["sent_password"]:
+                    exited_early = True
+                    break
+                if time.monotonic() > connect_deadline:
                     break
                 time.sleep(0.2)
-
         if connected:
             ifname, ip_addr = get_fctvpn_interface()
             if not (ifname and ip_addr):
@@ -990,6 +1226,8 @@ def forti_connect_pty(name, password, store=False):
                 time.sleep(1.0)
             if child_alive and not replaced:
                 _forti_stop_child(pid)
+            write_forti_state(False)
+            restore_network_on_disconnect()
             forti_attempt_clear(record)
             return
 
@@ -1016,8 +1254,13 @@ def forti_connect_pty(name, password, store=False):
                                  error="Connection cancelled by FortiClient.",
                                  cleanup_required=cleanup)
         elif unsupported:
-            forti_attempt_finish(record, "failed", reason="unsupported-prompt",
-                                 error=unsupported, cleanup_required=cleanup)
+            if certificate is not None:
+                reason = "certificate-mismatch" if pin else "certificate-untrusted"
+                forti_attempt_finish(record, "failed", reason=reason, error=unsupported,
+                                     certificate=certificate, cleanup_required=cleanup)
+            else:
+                forti_attempt_finish(record, "failed", reason="unsupported-prompt",
+                                     error=unsupported, cleanup_required=cleanup)
         else:
             early_exit = exited_early and native.get("state") in ("disconnected", "not_installed")
             if early_exit:
@@ -1035,20 +1278,17 @@ def forti_connect_pty(name, password, store=False):
             pass
 
 
-def forti_disconnect_bg():
+def _forti_disconnect_run(timeout):
     import select
-    current = _forti_attempt_read()
-    profile = current.get("profile") or forti_native_status().get("profile", "")
-    record = forti_attempt_start(profile, "disconnecting", FORTI_DISCONNECT_TIMEOUT)
     master, pid = _forti_pty_open(["forticlient", "vpn", "disconnect"])
     buf = bytearray()
     confirmations = 0
     child_alive = True
     success = False
     unsupported = ""
-    deadline = record["deadline"]
+    deadline = time.monotonic() + timeout
     try:
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             if child_alive:
                 readable, _, _ = select.select([master], [], [], 0.2)
                 if readable:
@@ -1066,8 +1306,8 @@ def forti_disconnect_bg():
                         if b"VPN is not running" in buf:
                             success = True
                             break
-                        prompt_error, _, confirmations = _forti_answer_prompts(
-                            buf, master, None, False, confirmations)
+                        prompt_error, confirmations = _forti_disconnect_prompts(
+                            buf, master, confirmations)
                         if prompt_error:
                             unsupported = prompt_error
                             break
@@ -1093,24 +1333,33 @@ def forti_disconnect_bg():
         if success:
             if child_alive and not _forti_wait_child(pid, 5):
                 _forti_stop_child(pid)
-            write_forti_state(False)
-            restore_network_on_disconnect()
-            forti_attempt_clear(record)
-            return
-
+            return True, ""
         if child_alive:
             _forti_stop_child(pid)
-        native = forti_native_status()
-        cleanup = native.get("state") not in ("disconnected", "not_installed")
-        error = unsupported or "FortiClient did not disconnect within 30 seconds."
-        forti_attempt_finish(record, "failed",
-                             reason="unsupported-prompt" if unsupported else "timeout",
-                             error=error, cleanup_required=cleanup)
+        return False, unsupported
     finally:
         try:
             os.close(master)
         except Exception:
             pass
+
+
+def forti_disconnect_bg():
+    current = _forti_attempt_read()
+    profile = current.get("profile") or forti_native_status().get("profile", "")
+    record = forti_attempt_start(profile, "disconnecting", FORTI_DISCONNECT_TIMEOUT)
+    success, unsupported = _forti_disconnect_run(FORTI_DISCONNECT_TIMEOUT)
+    if success:
+        write_forti_state(False)
+        restore_network_on_disconnect()
+        forti_attempt_clear(record)
+        return
+    native = forti_native_status()
+    cleanup = native.get("state") not in ("disconnected", "not_installed")
+    error = unsupported or "FortiClient did not disconnect within 30 seconds."
+    forti_attempt_finish(record, "failed",
+                         reason="unsupported-prompt" if unsupported else "timeout",
+                         error=error, cleanup_required=cleanup)
 
 
 def _spawn_forti_helper(action, name, password):
@@ -1124,6 +1373,29 @@ def _spawn_forti_helper(action, name, password):
         pass
 
 
+def _forti_prepare_connect():
+    merged = forti_status()
+    if merged.get("connected"):
+        raise ValueError("A FortiClient VPN is already connected. Disconnect it first.")
+    if not merged.get("cleanupRequired"):
+        return
+    # A failed attempt can leave a daemon session behind. Clear it here instead
+    # of making the user press Clean up and retry by hand.
+    _forti_disconnect_run(25)
+    record = _forti_attempt_read()
+    if record.get("phase") == "failed":
+        forti_attempt_clear(record)
+    end = time.monotonic() + 6.0
+    while time.monotonic() < end:
+        merged = forti_status()
+        if merged.get("connected"):
+            raise ValueError("A FortiClient VPN is already connected. Disconnect it first.")
+        if not merged.get("cleanupRequired"):
+            return
+        time.sleep(0.4)
+    raise ValueError("FortiClient kept a stale connection state after cleanup. Refresh and retry.")
+
+
 def forti_connect_with_password(name, password):
     require("forticlient")
     if name not in forti_list():
@@ -1131,11 +1403,7 @@ def forti_connect_with_password(name, password):
     if not _forti_valid_secret(password):
         raise ValueError("Forti password is empty or contains invalid characters.")
     _forti_require_idle()
-    merged = forti_status()
-    if merged.get("connected"):
-        raise ValueError("A FortiClient VPN is already connected. Disconnect it first.")
-    if merged.get("cleanupRequired"):
-        raise ValueError("FortiClient has a stale connection state. Clean up before retrying.")
+    _forti_prepare_connect()
     _spawn_forti_helper("bg-connect-forti-pass", name, password)
     return {"message": f"Connecting to FortiClient '{name}'…"}
 
@@ -1145,11 +1413,7 @@ def forti_connect(name):
     if name not in forti_list():
         raise ValueError(f"FortiClient profile '{name}' is not registered.")
     _forti_require_idle()
-    merged = forti_status()
-    if merged.get("connected"):
-        raise ValueError("A FortiClient VPN is already connected. Disconnect it first.")
-    if merged.get("cleanupRequired"):
-        raise ValueError("FortiClient has a stale connection state. Clean up before retrying.")
+    _forti_prepare_connect()
     password, reason = forti_credential_lookup(name)
     if not password:
         return {"passwordRequired": name, "reason": reason}
@@ -1184,10 +1448,11 @@ def forti_delete(name):
     res = subprocess.run([client, "vpn", "remove", name], capture_output=True, text=True, timeout=10)
     if res.returncode != 0:
         raise ValueError(f"Failed to remove FortiClient profile '{name}'.")
+    forti_pin_clear(name)
     record = _forti_attempt_read()
     if record.get("profile") == name:
         forti_attempt_clear(record)
-    return {"message": f"FortiClient profile '{name}' removed.", "forti": forti_list()}
+    return {**forti_profile_payload(), "message": f"FortiClient profile '{name}' removed."}
 
 
 def forti_create(name, host, port, username):
@@ -1199,13 +1464,14 @@ def forti_create(name, host, port, username):
         if not secret_tool_clear(identity):
             raise ValueError("Could not remove the existing saved Forti password; the profile was not replaced.")
         subprocess.run([client, "vpn", "remove", name], capture_output=True, text=True, timeout=5)
+        forti_pin_clear(name)
     p = subprocess.Popen([client, "vpn", "edit", name],
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     inputs = f"{host}\n{port}\n1\n{username}\n3\n"
     stdout, stderr = p.communicate(inputs, timeout=10)
     if p.returncode != 0:
         raise ValueError(f"Failed to create FortiClient profile '{name}'.")
-    return {"message": f"FortiClient profile '{name}' created.", "forti": forti_list()}
+    return {**forti_profile_payload(), "message": f"FortiClient profile '{name}' created."}
 
 
 def form_forti():
@@ -1240,14 +1506,14 @@ def import_path(path):
         if forti_conns:
             for c in forti_conns:
                 forti_create(c["name"], c["host"], c["port"], c["username"])
-            return {"forti": forti_list(), "message": "FortiClient profile(s) imported from XML."}
+            return {**forti_profile_payload(), "message": "FortiClient profile(s) imported from XML."}
         # Path metadata only: no open, parse, copy, or validation of XML contents.
         return {"azure": register(path), "message": "Profile imported."}
     if suffix in (".conf", ".sconf"):
         forti_info = parse_forti_conf(path)
         if forti_info:
             forti_create(forti_info["name"], forti_info["host"], forti_info["port"], forti_info["username"])
-            return {"forti": forti_list(), "message": f"FortiClient profile '{forti_info['name']}' imported.", "forti": forti_list()}
+            return {**forti_profile_payload(), "message": f"FortiClient profile '{forti_info['name']}' imported."}
     kind = {".ovpn": "openvpn", ".conf": "wireguard"}.get(suffix)
     if not kind:
         raise ValueError("Supported files: OpenVPN .ovpn, WireGuard .conf, Azure .xml, FortiClient .conf/.xml.")
@@ -1554,10 +1820,14 @@ def main():
         return form_forti()
     if action == "clear-forti-auth":
         return forti_clear_auth()
+    if action == "approve-forti-cert":
+        return dict(forti_pin_set(sys.argv[2], sys.argv[3], sys.argv[4]), approved=True)
+    if action == "forget-forti-cert":
+        return {"profile": sys.argv[2], "forgotten": forti_pin_clear(sys.argv[2])}
     if action == "connect-forti-pass":
         return forti_connect_with_password(sys.argv[2], read_forti_password_from_stdin())
     if action == "list":
-        return {"azure": load(), "forti": forti_list()}
+        return {**forti_profile_payload(), "azure": load()}
     if action == "credential-status":
         return forti_credential_status(sys.argv[2])
     if action == "details-nm":

@@ -411,6 +411,80 @@ Panel {
             }
           }
 
+          Rectangle {
+            id: fortiCertificateCard
+            width: parent.width
+            implicitHeight: fortiCertificateColumn.implicitHeight + Style.space(24)
+            visible: vpn.fortiCertificatePrompt
+            radius: Style.space(6)
+            color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
+            border.width: 1
+            border.color: root.foreground
+
+            Connections {
+              target: vpn
+              function onFortiCertificatePromptChanged() {
+                if (vpn.fortiCertificatePrompt) panelFlick.contentY = 0
+              }
+            }
+
+            Column {
+              id: fortiCertificateColumn
+              anchors {
+                left: parent.left
+                right: parent.right
+                top: parent.top
+                margins: Style.space(12)
+              }
+              spacing: Style.space(8)
+
+              Text {
+                width: parent.width
+                text: "Untrusted VPN server certificate"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+              }
+              Text {
+                width: parent.width
+                text: "FortiClient does not trust the certificate presented by '" + vpn.fortiCertificateProfile + "'. Compare the hostname and SHA-1 fingerprint with the gateway operator, then trust it to pin this certificate. Any later certificate with a different fingerprint is rejected."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.Wrap
+              }
+              Text {
+                width: parent.width
+                text: "Host: " + vpn.fortiCertificateHost + "\nSHA-1: " + vpn.fortiCertificateFingerprint
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.Wrap
+              }
+              Row {
+                spacing: Style.space(8)
+                Button {
+                  focusable: true
+                  Accessible.role: Accessible.Button
+                  Accessible.name: "Trust this certificate and connect"
+                  Accessible.onPressAction: clicked()
+                  text: "Trust and connect"
+                  enabled: !vpn.importing
+                  onClicked: vpn.approveFortiCertificate()
+                }
+                Button {
+                  focusable: true
+                  Accessible.role: Accessible.Button
+                  Accessible.name: "Cancel and do not trust this certificate"
+                  Accessible.onPressAction: clicked()
+                  text: "Cancel"
+                  onClicked: vpn.cancelFortiCertificate()
+                }
+              }
+            }
+          }
+
           //
           // HERO
           //
