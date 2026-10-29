@@ -126,7 +126,7 @@ python3 profiles.py credential-status evans
 
 The result contains `saved`, `length`, and `reason`; it never includes the password. If `saved` is false, the next connect prompts. If it is true but the panel says the saved password was rejected, the stored password is stale; entering a new password replaces it only after a successful connection.
 
-Disconnect runs in a detached PTY helper with a 30-second deadline. It answers only the native `Confirmation Required` / `Confirm (y/n)` prompt and never sends a password; any other prompt (password, FortiToken, certificate) stops the helper without a secret.
+Disconnect runs in a detached PTY helper with a 30-second deadline. It answers the native `Confirmation Required` / `Confirm (y/n)` prompt only after the prompt has stopped arriving and it still matches that banner; a bare or otherwise unrecognized confirmation, a password, a FortiToken, or a certificate prompt stops the helper without sending a secret. FortiClient 7.4.3.5411 disconnects without asking at all, so this path exists for builds that still prompt.
 
 After FortiClient drops the tunnel, the panel never invokes sudo or a polkit-protected command, so no password prompt appears. It waits for FortiClient's own `/etc/resolv.conf` restore (bounded), reapplies the physical NetworkManager connection, and checks resolution. Only if DNS is still broken does it reapply the already-configured desktop DNS provider through `sudo -n /usr/bin/omarchy-dns <provider>`; Omarchy grants those three provider names without a password, and `sudo -n` cannot prompt, so `Custom` DNS is left untouched rather than asking for a password. `nmcli general reload` and `resolvectl flush-caches` are deliberately not used because both require interactive authorization.
 

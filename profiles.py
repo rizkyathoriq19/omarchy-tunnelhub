@@ -256,6 +256,7 @@ FORTI_CONNECT_TIMEOUT = 90
 FORTI_DISCONNECT_TIMEOUT = 30
 FORTI_KEYRING_TIMEOUT = 10
 FORTI_CONFIRM_LIMIT = 3
+FORTI_CONFIRM_SETTLE = 0.25
 FORTI_PIN_FILE = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "airzy.vpn/forti-pins.json"
 
 
@@ -1021,7 +1022,9 @@ def _forti_connect_prompts(buf, master, password, pin, state):
 
 
 def _forti_disconnect_unknown_prompt(buf):
-    probe = bytes(buf).lower()
+    text = bytes(buf)
+    probe = text.lower()
+    native = b"confirmation required" in probe
     for marker in (b"confirm (y/n)", b"confirmation required", b"confirmed"):
         probe = probe.replace(marker, b"")
     if any(m in probe for m in (b"confirm", b"accept", b"certificate",
@@ -1029,6 +1032,8 @@ def _forti_disconnect_unknown_prompt(buf):
         return "FortiClient requested an unsupported confirmation or certificate prompt during disconnection."
     if any(m in probe for m in (b"password", b"token")):
         return "FortiClient requested an unsupported authentication prompt during disconnection."
+    if b"confirm (y/n)" in text.lower() and not native:
+        return "FortiClient requested an unrecognized confirmation during disconnection."
     return ""
 
 
@@ -1038,6 +1043,10 @@ def _forti_disconnect_prompts(buf, master, confirmations):
         return prompt_error, confirmations
 
     while b"Confirm (y/n)" in buf and confirmations < FORTI_CONFIRM_LIMIT:
+        # Re-check before every answer: the buffer may have grown since entry.
+        prompt_error = _forti_disconnect_unknown_prompt(buf)
+        if prompt_error:
+            return prompt_error, confirmations
         if not _forti_write(master, b"y\n"):
             return "FortiClient closed the connection while a confirmation was pending.", confirmations
         confirmations += 1
@@ -1278,6 +1287,14 @@ def forti_connect_pty(name, password, store=False):
             pass
 
 
+def forti_confirmation_settled(buf, last_data, now=None):
+    """A confirmation may only be answered once the prompt stopped growing."""
+    if b"Confirm (y/n)" not in buf:
+        return True
+    now = time.monotonic() if now is None else now
+    return (now - last_data) >= FORTI_CONFIRM_SETTLE
+
+
 def _forti_disconnect_run(timeout):
     import select
     master, pid = _forti_pty_open(["forticlient", "vpn", "disconnect"])
@@ -1287,6 +1304,7 @@ def _forti_disconnect_run(timeout):
     success = False
     unsupported = ""
     deadline = time.monotonic() + timeout
+    last_data = time.monotonic()
     try:
         while time.monotonic() < deadline:
             if child_alive:
@@ -1301,16 +1319,22 @@ def _forti_disconnect_run(timeout):
                             pass
                     else:
                         buf.extend(chunk)
+                        last_data = time.monotonic()
                         if len(buf) > 65536:
                             del buf[:-8192]
                         if b"VPN is not running" in buf:
                             success = True
                             break
-                        prompt_error, confirmations = _forti_disconnect_prompts(
-                            buf, master, confirmations)
-                        if prompt_error:
-                            unsupported = prompt_error
-                            break
+                # FortiClient writes a prompt in one go, so only answer a
+                # confirmation once the buffer has stopped growing. Anything
+                # that shares the native banner (a certificate warning) is then
+                # fully buffered and rejected instead of confirmed.
+                if not success and forti_confirmation_settled(buf, last_data):
+                    prompt_error, confirmations = _forti_disconnect_prompts(
+                        buf, master, confirmations)
+                    if prompt_error:
+                        unsupported = prompt_error
+                        break
                 if not success:
                     native = forti_native_status()
                     if native.get("state") in ("disconnected", "not_installed"):
