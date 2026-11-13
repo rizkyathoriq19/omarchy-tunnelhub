@@ -54,16 +54,16 @@ def run(profile, command='nmcli', timeout=90):
         value = bytes(offered)
         extra = {"secret": prompt_key}
         if secrets_store.keyring_available():
-            secrets_store.store("nm", profile, value, extra, plaintext=False)
+            secrets_store.store("nm", profile, value, extra)
         else:
-            # The panel only sends the third field when the user chose the
-            # unencrypted store, so this records the consent they gave.
-            if consent_this_attempt and not secrets_store.consent_allowed():
+            # The panel only sends the third field when the user chose
+            # NetworkManager's own storage for this password.
+            if consent_this_attempt and not secrets_store.nm_storage_allowed():
                 try:
-                    secrets_store.record_consent()
+                    secrets_store.allow_nm_storage()
                 except OSError:
                     pass
-            if secrets_store.consent_allowed():
+            if secrets_store.nm_storage_allowed():
                 secrets_store.nm_store(profile, prompt_key, value)
         offered[:] = b'\0' * len(offered)
         offered = None
