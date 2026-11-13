@@ -115,6 +115,26 @@ Panel {
     }
   }
 
+  component KindBadge: Rectangle {
+    id: badge
+    property string kind: ""
+    property bool connected: false
+    color: "transparent"
+    border.color: badge.connected ? root.accent : root.dim
+    border.width: 1
+    radius: Style.space(2)
+    implicitWidth: badgeLabel.implicitWidth + Style.space(8)
+    implicitHeight: badgeLabel.implicitHeight + Style.space(4)
+    Text {
+      id: badgeLabel
+      anchors.centerIn: parent
+      text: badge.kind
+      color: badge.connected ? root.accent : root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+  }
+
   readonly property int profileCount: vpn.profiles.length + vpn.azureProfiles.length + (vpn.fortiProfiles ? vpn.fortiProfiles.length : 0)
 
   function selectedProfile() {
@@ -746,7 +766,7 @@ Panel {
 
                     Column {
                       width:
-                        Math.max(0, parent.width - nmIndicator.width - nmSwitch.width - nmDelete.width - parent.spacing * 3)
+                        Math.max(0, parent.width - nmIndicator.width - nmBadge.width - nmSwitch.width - nmDelete.width - parent.spacing * 4)
 
                       spacing: Style.space(1)
 
@@ -788,6 +808,12 @@ Panel {
                           Text.ElideRight
                       }
                     }
+                    KindBadge {
+                      id: nmBadge
+                      anchors.verticalCenter: parent.verticalCenter
+                      kind: vpn.nmBadgeText(modelData)
+                      connected: vpn.nmRowStatus(modelData.uuid) === "connected"
+                    }
                     ToggleSwitch {
                       id: nmSwitch
                       anchors.verticalCenter: parent.verticalCenter
@@ -818,7 +844,7 @@ Panel {
 
                   HoverHandler { id: nmHover }
                   ToolTip.visible: nmHover.hovered
-                  ToolTip.text: modelData.name + " · " + modelData.uuid + " · " + (vpn.nmRowStatus(modelData.uuid))
+                  ToolTip.text: modelData.name + " · " + modelData.uuid + " · " + (vpn.nmRowStatus(modelData.uuid)) + " · " + modelData.label
                 }
               }
 
@@ -852,7 +878,7 @@ Panel {
                       font.pixelSize: Style.font.body
                     }
                     Column {
-                      width: Math.max(0, parent.width - azureIndicator.width - azureSwitch.width - azureDelete.width - parent.spacing * 3)
+                      width: Math.max(0, parent.width - azureIndicator.width - azureBadge.width - azureSwitch.width - azureDelete.width - parent.spacing * 4)
                       spacing: Style.space(1)
                       Text {
                         width: parent.width
@@ -870,6 +896,12 @@ Panel {
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
                       }
+                    }
+                    KindBadge {
+                      id: azureBadge
+                      anchors.verticalCenter: parent.verticalCenter
+                      kind: "AZURE"
+                      connected: vpn.azure.connected && vpn.azure.path === modelData
                     }
                     ToggleSwitch {
                       id: azureSwitch
@@ -901,7 +933,7 @@ Panel {
                   }
                   HoverHandler { id: azureHover }
                   ToolTip.visible: azureHover.hovered
-                  ToolTip.text: modelData.split("/").pop() + " · " + (vpn.azureRowStatus(modelData))
+                  ToolTip.text: modelData.split("/").pop() + " · " + (vpn.azureRowStatus(modelData)) + " · Azure"
                 }
               }
               Repeater {
@@ -934,7 +966,7 @@ Panel {
                       font.pixelSize: Style.font.body
                     }
                     Column {
-                      width: Math.max(0, parent.width - fortiIndicator.width - fortiSwitch.width - fortiDelete.width - parent.spacing * 3)
+                      width: Math.max(0, parent.width - fortiIndicator.width - fortiBadge.width - fortiSwitch.width - fortiDelete.width - parent.spacing * 4)
                       spacing: Style.space(1)
                       Text {
                         width: parent.width
@@ -952,6 +984,12 @@ Panel {
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
                       }
+                    }
+                    KindBadge {
+                      id: fortiBadge
+                      anchors.verticalCenter: parent.verticalCenter
+                      kind: "FORTI"
+                      connected: vpn.forti.connected && vpn.forti.profile === modelData
                     }
                     ToggleSwitch {
                       id: fortiSwitch

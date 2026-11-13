@@ -158,6 +158,35 @@ def nm_details(profile):
     return {"uuid": profile, "address": address, "interface": matches.pop() if len(matches) == 1 else ""}
 
 
+def nm_vpn_types():
+    # Bulk subtype map for NetworkManager VPN rows. TYPE is only "vpn" in
+    # list output, so OVPN vs SSTP needs vpn.service-type per profile.
+    result = subprocess.run([require("nmcli"), "-t", "-f", "UUID,TYPE", "connection", "show"],
+                            capture_output=True, text=True, timeout=15)
+    if result.returncode:
+        raise ValueError("Could not read VPN profile types.")
+    uuids = []
+    for line in result.stdout.splitlines():
+        if not line:
+            continue
+        parts = line.split(":")
+        if len(parts) < 2 or parts[-1] != "vpn":
+            continue
+        uuid = parts[-2]
+        if ovpn_source.valid_uuid(uuid):
+            uuids.append(uuid)
+    types = {}
+    for uuid in uuids:
+        try:
+            detail = subprocess.run([require("nmcli"), "-g", "vpn.service-type", "connection", "show", "uuid", uuid],
+                                    capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if detail.returncode == 0 and detail.stdout.strip():
+            types[uuid] = detail.stdout.strip()
+    return {"nmTypes": types}
+
+
 def parse_forti_xml(path):
     import xml.etree.ElementTree as ET
     try:
@@ -1852,6 +1881,8 @@ def main():
         return forti_connect_with_password(sys.argv[2], read_forti_password_from_stdin())
     if action == "list":
         return {**forti_profile_payload(), "azure": load()}
+    if action == "nm-types":
+        return nm_vpn_types()
     if action == "credential-status":
         return forti_credential_status(sys.argv[2])
     if action == "details-nm":
