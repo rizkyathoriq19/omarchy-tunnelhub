@@ -227,6 +227,17 @@ Panel {
         ? "Connected: " + vpn.activeProfile
         : vpn.statusTitle
     }
+
+    function secrets(): string {
+      return JSON.stringify(vpn.secretStatus)
+    }
+
+    function forgetSecret(kind: string, ident: string): string {
+      if (kind !== "forti" && kind !== "nm") return "invalid"
+      if (ident === "") return "invalid"
+      vpn.forgetSecret(kind, ident)
+      return "ok"
+    }
   }
 
   BarIconButton {
@@ -383,6 +394,24 @@ Panel {
                 font.pixelSize: Style.font.caption
                 wrapMode: Text.Wrap
               }
+              Text {
+                width: parent.width
+                visible: vpn.secretConsentNeeded
+                text: "GNOME Keyring is unavailable. This choice stores the password unencrypted in " + vpn.secretStatus.plaintextPath + " with mode 0600. For an encrypted private key, a stored passphrase beside the key removes the benefit of that encryption. Leave it off to use the password once."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.Wrap
+              }
+              Text {
+                width: parent.width
+                visible: !vpn.secretConsentNeeded && vpn.secretKeyring && (vpn.certificatePrompt || vpn.fortiPrompt)
+                text: "The password is saved in GNOME Keyring after a successful connection."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.Wrap
+              }
               NativeUi.TextField {
                 id: permissionField
                 width: parent.width
@@ -406,6 +435,17 @@ Panel {
               }
               Row {
                 spacing: Style.space(8)
+                Button {
+                  id: permissionSave
+                  visible: vpn.secretConsentNeeded
+                  focusable: true
+                  Accessible.role: Accessible.CheckBox
+                  Accessible.name: "Store this password unencrypted"
+                  Accessible.checked: vpn.secretSaveChoice
+                  Accessible.onPressAction: clicked()
+                  text: vpn.secretSaveChoice ? "Save unencrypted: on" : "Save unencrypted: off"
+                  onClicked: vpn.secretSaveChoice = !vpn.secretSaveChoice
+                }
                 Button {
                   id: permissionSubmit
                   focusable: true
@@ -766,7 +806,7 @@ Panel {
 
                     Column {
                       width:
-                        Math.max(0, parent.width - nmIndicator.width - nmBadge.width - nmSwitch.width - nmDelete.width - parent.spacing * 4)
+                        Math.max(0, parent.width - nmIndicator.width - nmBadge.width - (vpn.savedSecret("nm", modelData.uuid) ? nmForget.width : 0) - nmSwitch.width - nmDelete.width - parent.spacing * 5)
 
                       spacing: Style.space(1)
 
@@ -813,6 +853,17 @@ Panel {
                       anchors.verticalCenter: parent.verticalCenter
                       kind: vpn.nmBadgeText(modelData)
                       connected: vpn.nmRowStatus(modelData.uuid) === "connected"
+                    }
+                    Button {
+                      id: nmForget
+                      anchors.verticalCenter: parent.verticalCenter
+                      visible: vpn.savedSecret("nm", modelData.uuid)
+                      focusable: true
+                      text: "Forget"
+                      Accessible.name: "Forget saved password for " + modelData.name
+                      Accessible.onPressAction: clicked()
+                      tooltipText: "Remove the saved password from this plugin's store"
+                      onClicked: vpn.forgetSecret("nm", modelData.uuid)
                     }
                     ToggleSwitch {
                       id: nmSwitch
@@ -966,7 +1017,7 @@ Panel {
                       font.pixelSize: Style.font.body
                     }
                     Column {
-                      width: Math.max(0, parent.width - fortiIndicator.width - fortiBadge.width - fortiSwitch.width - fortiDelete.width - parent.spacing * 4)
+                      width: Math.max(0, parent.width - fortiIndicator.width - fortiBadge.width - (vpn.savedSecret("forti", modelData) ? fortiForget.width : 0) - fortiSwitch.width - fortiDelete.width - parent.spacing * 5)
                       spacing: Style.space(1)
                       Text {
                         width: parent.width
@@ -990,6 +1041,17 @@ Panel {
                       anchors.verticalCenter: parent.verticalCenter
                       kind: "FORTI"
                       connected: vpn.forti.connected && vpn.forti.profile === modelData
+                    }
+                    Button {
+                      id: fortiForget
+                      anchors.verticalCenter: parent.verticalCenter
+                      visible: vpn.savedSecret("forti", modelData)
+                      focusable: true
+                      text: "Forget"
+                      Accessible.name: "Forget saved password for " + modelData
+                      Accessible.onPressAction: clicked()
+                      tooltipText: "Remove the saved password from this plugin's store"
+                      onClicked: vpn.forgetSecret("forti", modelData)
                     }
                     ToggleSwitch {
                       id: fortiSwitch

@@ -111,9 +111,9 @@ plugin state.
 
 ## FortiClient SSL-VPN
 
-The panel lists FortiClient CLI profiles (`forticlient vpn list`) and manages connections through the native CLI. The plugin owns the Forti password; it is stored in GNOME Keyring through `secret-tool` under the credential identity **profile name + gateway host + username**. The plugin always connects with `forticlient vpn connect NAME -p` and never passes `-s`; FortiClient's own Save Password flag is left untouched and ignored. No password is written to JSON, plugin state files, argv, environment variables, or logs.
+The panel lists FortiClient CLI profiles (`forticlient vpn list`) and manages connections through the native CLI. The plugin owns the Forti password; it is stored in GNOME Keyring through `secret-tool` under the credential identity **profile name + gateway host + username**, or in the opt-in unencrypted store described in [Saved passwords](#saved-passwords). The plugin always connects with `forticlient vpn connect NAME -p` and never passes `-s`; FortiClient's own Save Password flag is left untouched and ignored. No password is written to argv, environment variables, or logs.
 
-On connect, the widget tries the saved credential first. If FortiClient explicitly rejects it, the panel asks for a new password; the new password replaces the saved one only after a native `fctvpn` interface with an IPv4 address is confirmed. The first connection after this change prompts once, then saves after success. If GNOME Keyring is unavailable, the widget fails closed: it prompts for every connection, uses the password only for that attempt, and reports that it could not be saved. There is no plaintext or encrypted JSON fallback. Deleting a Forti profile clears its keyring item first; if the item cannot be cleared, deletion fails closed so no orphan secret remains. The plugin never stores the system/sudo password.
+On connect, the widget tries the saved credential first. If FortiClient explicitly rejects it, the panel asks for a new password; the new password replaces the saved one only after a native `fctvpn` interface with an IPv4 address is confirmed. The first connection after this change prompts once, then saves after success. When GNOME Keyring is unavailable, the panel offers unencrypted storage only after an explicit choice; declining uses the password for that attempt and reports that it was not saved. Deleting a Forti profile clears its saved password first; if the entry cannot be cleared, deletion fails closed so no orphan secret remains. The plugin never stores the system/sudo password. See [Saved passwords](#saved-passwords).
 
 Each connect attempt has a 90-second deadline. Two prompts can appear during connect, and neither is answered silently. A `Password:` prompt is answered once with the stored credential. An untrusted-server certificate warning (`Confirm (y/n)` / `Accept (y/n)` carrying `Hostname:` and `Fingerprint (SHA1):`) fails the attempt closed and surfaces the hostname plus SHA-1 fingerprint in the panel; choosing **Trust and connect** pins that host and fingerprint to the profile in `~/.local/state/airzy.vpn/forti-pins.json` (mode 0600) and reconnects. Later connections answer the warning only when both the hostname and fingerprint match the pin; any other certificate is rejected as a mismatch, so an impostor gateway cannot collect the VPN credential. Deleting or replacing a Forti profile clears its pin. Any other prompt (FortiToken, new-password, unknown confirmation) stops the helper without sending a secret. A leftover daemon session from a failed attempt is disconnected automatically before the next connect instead of requiring a manual **Clean up**; the panel still offers **Clean up** and a fixed timeout error when a tunnel never comes up. New Forti profiles are created with prompt authentication; the plugin does not enable FortiClient Save Password.
 
@@ -130,7 +130,7 @@ Disconnect runs in a detached PTY helper with a 30-second deadline. It answers t
 
 After FortiClient drops the tunnel, the panel never invokes sudo or a polkit-protected command, so no password prompt appears. It waits for FortiClient's own `/etc/resolv.conf` restore (bounded), reapplies the physical NetworkManager connection, and checks resolution. Only if DNS is still broken does it reapply the already-configured desktop DNS provider through `sudo -n /usr/bin/omarchy-dns <provider>`; Omarchy grants those three provider names without a password, and `sudo -n` cannot prompt, so `Custom` DNS is left untouched rather than asking for a password. `nmcli general reload` and `resolvectl flush-caches` are deliberately not used because both require interactive authorization.
 
-Requirements: `forticlient` CLI (observed with 7.4.3.5411), `secret-tool`, and an available GNOME Keyring for persistent Forti credentials. Verified live against a FortiGate gateway presenting an untrusted certificate: the warning is surfaced with its SHA-1 fingerprint, approval pins it, reconnect succeeds, and disconnect restores DNS without a password prompt.
+Requirements: `forticlient` CLI (observed with 7.4.3.5411) and optionally `secret-tool` with a working GNOME Keyring for persistent Forti credentials. Verified live against a FortiGate gateway presenting an untrusted certificate: the warning is surfaced with its SHA-1 fingerprint, approval pins it, reconnect succeeds, and disconnect restores DNS without a password prompt.
 
 ## SSTP VPN with certificate authentication (EAP-TLS)
 
@@ -189,6 +189,42 @@ gateways often expire quickly; if a previously working profile stops
 connecting, check the certificate dates first (`openssl x509 -noout -dates
 -in client-cert.pem`). Never include certificates, keys, passwords or
 personal gateway hostnames in the plugin repository or issue reports.
+
+## Saved passwords
+
+TunnelHub saves two kinds of secret: the FortiClient VPN password, and the
+NetworkManager certificate password used by OpenVPN `cert-pass` and SSTP
+`tls-user-key-secret`. One shared store serves both, with two backends.
+
+GNOME Keyring is the preferred backend. The plugin probes it by storing,
+reading, and clearing a throwaway item, because an installed `secret-tool` does
+not prove a usable collection. When the probe passes, a typed password is saved
+after a successful connection without further prompts, and later connections
+answer the native prompt from the keyring.
+
+When the probe fails, the panel adds one explicit choice to the password card:
+**Save unencrypted: off**. Turning it on records consent for
+`$XDG_STATE_HOME/airzy.vpn/secrets.json` (mode 0600, atomic replacement) and
+states the path and the risk. Declining keeps the password for that attempt
+only. Consent is remembered in `secret-policy.json`; the panel stops asking
+after it is recorded. The NetworkManager path uses NetworkManager's own secret
+storage instead of that file, written through `nmcli connection modify` with the
+secret flags set to `0`, so NetworkManager owns the keyfile and removes the
+secret with the profile. The `nmcli` call accepts a secret only as an argument,
+so the value is visible in that process's argv for the duration of one short
+call. The keyring path has no such exposure.
+
+Storing the SSTP private-key passphrase unencrypted next to
+`client-key.pem` removes the benefit of that key's encryption. The panel states
+this before consent is given.
+
+A row with a saved password shows **Forget**, which removes the plugin-owned
+entry and the keyring item. For a NetworkManager profile it also removes the
+copy NetworkManager stored in its own keyfile and restores the ask-every-time
+secret flag. Deleting a profile clears its saved password before the native
+delete runs, and a failed clear stops the delete so no orphan secret remains.
+Tests for the store live in `tests/test_secret_storage.py` and run with
+`python3 -m unittest discover -s tests -v`.
 
 ## Azure VPN with OpenP2S
 

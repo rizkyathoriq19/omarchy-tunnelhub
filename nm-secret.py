@@ -10,6 +10,13 @@ import sys
 import time
 import uuid
 import ovpn_source
+import secrets_store
+
+# The two masked prompts this helper answers, in prompt-string order. The
+# index names the NetworkManager secret property so a saved value can be
+# matched to the right field.
+PROMPTS = ((b'Certificate password (vpn.secrets.cert-pass): ', 'cert-pass'),
+           (b'Certificate password: (vpn.secrets.tls-user-key-secret): ', 'tls-user-key-secret'))
 
 
 def run(profile, command='nmcli', timeout=90):
@@ -33,7 +40,33 @@ def run(profile, command='nmcli', timeout=90):
     response = bytearray()
     pending = ''
     file_attempted = False
+    prompt_key = ''
+    offered = None
+    consent_this_attempt = False
     deadline = time.monotonic() + timeout
+
+    def persist(code):
+        # Save only a value the user typed in this attempt, and only after
+        # nmcli confirmed activation.
+        nonlocal offered
+        if code != 0 or offered is None or not prompt_key:
+            return
+        value = bytes(offered)
+        extra = {"secret": prompt_key}
+        if secrets_store.keyring_available():
+            secrets_store.store("nm", profile, value, extra, plaintext=False)
+        else:
+            # The panel only sends the third field when the user chose the
+            # unencrypted store, so this records the consent they gave.
+            if consent_this_attempt and not secrets_store.consent_allowed():
+                try:
+                    secrets_store.record_consent()
+                except OSError:
+                    pass
+            if secrets_store.consent_allowed():
+                secrets_store.nm_store(profile, prompt_key, value)
+        offered[:] = b'\0' * len(offered)
+        offered = None
 
     def done():
         nonlocal pending
@@ -53,7 +86,9 @@ def run(profile, command='nmcli', timeout=90):
                 if key.fileobj is child.stdout:
                     if not chunk:
                         done()
-                        return {0: 0, 3: 2}.get(child.wait(), 1)
+                        code = {0: 0, 3: 2}.get(child.wait(), 1)
+                        persist(code)
+                        return code
                     output.extend(chunk)
                     chunk = b''
                     while b'\n' in output:
@@ -72,13 +107,13 @@ def run(profile, command='nmcli', timeout=90):
                     # below and the helper deadline. No other prompt is
                     # answered; add explicit mappings only when another native
                     # secret is requested and its bytes are verified.
-                    prompts = (b'Certificate password (vpn.secrets.cert-pass): ',
-                               b'Certificate password: (vpn.secrets.tls-user-key-secret): ')
+                    prompts = tuple(prompt for prompt, _ in PROMPTS)
                     prompt = bytes(output)
                     if prompt in prompts:
                         if pending:
                             return 1
                         output.clear()
+                        secret_key = PROMPTS[prompts.index(prompt)][1]
                         if not file_attempted and prompt.endswith(b'cert-pass): '):
                             file_attempted = True
                             value = ovpn_source.password(profile)
@@ -89,6 +124,14 @@ def run(profile, command='nmcli', timeout=90):
                                 finally:
                                     value[:] = b'\0' * len(value)
                                 continue
+                        # A saved value answers the native prompt without a panel
+                        # round-trip. Keyring first, then the consented file.
+                        saved, _reason = secrets_store.lookup("nm", profile, {"secret": secret_key})
+                        if saved:
+                            child.stdin.write(saved + b'\n')
+                            child.stdin.flush()
+                            continue
+                        prompt_key = secret_key
                         pending = secrets.token_hex(16)
                         os.write(sys.stdout.fileno(), ('REQUEST ' + pending + '\n').encode())
                     elif len(output) > 8192:
@@ -111,22 +154,32 @@ def run(profile, command='nmcli', timeout=90):
                         if line == b'CANCEL':
                             cancelled = True
                             return 1
-                        ident, sep, value = line.partition(b'\t')
+                        parts = line.split(b'\t')
+                        if len(parts) not in (2, 3):
+                            continue
+                        ident, value = parts[0], parts[1]
+                        save_this = len(parts) == 3 and parts[2] == b'1'
                         try:
                             if not pending or ident != pending.encode():
                                 continue
-                            if not sep or not value or len(value) > 4092 or any(c < 32 or c == 127 for c in value):
+                            if not value or len(value) > 4092 or any(c < 32 or c == 127 for c in value):
                                 cancelled = True
                                 return 1
                             child.stdin.write(value + b'\n')
                             child.stdin.flush()
+                            if save_this and prompt_key:
+                                # Keep the user-entered value only until the child exits.
+                                offered = bytearray(value)
+                                consent_this_attempt = True
                             done()
                         finally:
                             line[:] = b'\0' * len(line)
                             value[:] = b'\0' * len(value)
             if child.poll() is not None:
                 done()
-                return {0: 0, 3: 2}.get(child.returncode, 1)
+                code = {0: 0, 3: 2}.get(child.returncode, 1)
+                persist(code)
+                return code
         return 2  # Helper deadline, not evidence of a wrong password.
     except (OSError, KeyboardInterrupt):
         return 1
@@ -134,6 +187,8 @@ def run(profile, command='nmcli', timeout=90):
         done()
         output[:] = b'\0' * len(output)
         response[:] = b'\0' * len(response)
+        if offered is not None:
+            offered[:] = b'\0' * len(offered)
         selector.close()
         # Close/reload/cancel must not leave a credential reader behind.
         try:

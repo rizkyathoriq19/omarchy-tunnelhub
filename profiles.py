@@ -13,6 +13,7 @@ import tempfile
 import time
 from permission import Lease
 import ovpn_source
+import secrets_store
 
 def connection_settings():
     # Read the same inline widget settings in actions and the durable supervisor.
@@ -96,6 +97,9 @@ def remove(path):
 def delete_nm(profile):
     if not ovpn_source.valid_uuid(profile):
         raise ValueError("Select a profile UUID.")
+    # Clear the plugin-owned copy first; the native delete removes NM's own.
+    if not secrets_store.clear("nm", profile):
+        raise ValueError("Could not remove the saved VPN password; the profile was not deleted.")
     sources = ovpn_source.load()
     result = subprocess.run([require("nmcli"), "--wait", "30", "connection", "delete", "uuid", profile],
                             capture_output=True, text=True, timeout=35)
@@ -158,9 +162,7 @@ def nm_details(profile):
     return {"uuid": profile, "address": address, "interface": matches.pop() if len(matches) == 1 else ""}
 
 
-def nm_vpn_types():
-    # Bulk subtype map for NetworkManager VPN rows. TYPE is only "vpn" in
-    # list output, so OVPN vs SSTP needs vpn.service-type per profile.
+def nm_vpn_uuids():
     result = subprocess.run([require("nmcli"), "-t", "-f", "UUID,TYPE", "connection", "show"],
                             capture_output=True, text=True, timeout=15)
     if result.returncode:
@@ -172,11 +174,16 @@ def nm_vpn_types():
         parts = line.split(":")
         if len(parts) < 2 or parts[-1] != "vpn":
             continue
-        uuid = parts[-2]
-        if ovpn_source.valid_uuid(uuid):
-            uuids.append(uuid)
+        if ovpn_source.valid_uuid(parts[-2]):
+            uuids.append(parts[-2])
+    return uuids
+
+
+def nm_vpn_types():
+    # Bulk subtype map for NetworkManager VPN rows. TYPE is only "vpn" in
+    # list output, so OVPN vs SSTP needs vpn.service-type per profile.
     types = {}
-    for uuid in uuids:
+    for uuid in nm_vpn_uuids():
         try:
             detail = subprocess.run([require("nmcli"), "-g", "vpn.service-type", "connection", "show", "uuid", uuid],
                                     capture_output=True, text=True, timeout=10)
@@ -185,6 +192,38 @@ def nm_vpn_types():
         if detail.returncode == 0 and detail.stdout.strip():
             types[uuid] = detail.stdout.strip()
     return {"nmTypes": types}
+
+
+def secret_overview():
+    saved_forti = {}
+    if forti_installed():
+        for name in forti_list():
+            identity = forti_identity(name)
+            if identity:
+                saved_forti[name] = bool(secrets_store.lookup("forti", name, _forti_extra(identity))[0])
+    saved_nm = {}
+    for uuid in nm_vpn_uuids():
+        plugin_saved = bool(secrets_store.lookup("nm", uuid)[0])
+        saved_nm[uuid] = plugin_saved or secrets_store.nm_status(uuid)["saved"]
+    return {"backend": "keyring" if secrets_store.keyring_available() else "none",
+            "plaintextAllowed": secrets_store.consent_allowed(),
+            "plaintextPath": str(secrets_store.PLAINTEXT_FILE),
+            "saved": {"forti": saved_forti, "nm": saved_nm}}
+
+
+def secret_clear(kind, ident):
+    if kind == "forti":
+        forti_credential_clear(ident)
+        return {"cleared": True}
+    if kind == "nm":
+        if not ovpn_source.valid_uuid(ident):
+            raise ValueError("Select a profile UUID.")
+        if not secrets_store.clear("nm", ident):
+            raise ValueError("Could not remove the saved VPN password.")
+        if not secrets_store.nm_clear(ident):
+            raise ValueError("Could not remove the NetworkManager copy of the saved VPN password.")
+        return {"cleared": True}
+    raise ValueError("Unknown secret kind.")
 
 
 def parse_forti_xml(path):
@@ -505,68 +544,19 @@ def forti_identity(name):
     return {"profile": name, "host": host, "username": username}
 
 
-def _forti_secret_attrs(identity):
-    return ["service", "airzy.vpn", "kind", "forti",
-            "profile", identity["profile"], "host", identity["host"],
-            "username", identity["username"]]
-
-
 def _forti_valid_secret(value):
     return bool(value) and len(value) <= 4092 and not any(byte < 32 or byte == 127 for byte in value)
 
 
-def secret_tool_lookup(identity):
-    tool = shutil.which("secret-tool")
-    if not tool:
-        return b"", "keyring-unavailable"
-    try:
-        res = subprocess.run([tool, "lookup", *_forti_secret_attrs(identity)],
-                             capture_output=True, timeout=FORTI_KEYRING_TIMEOUT)
-    except Exception:
-        return b"", "keyring-unavailable"
-    if res.returncode != 0:
-        return b"", "keyring-unavailable" if res.stderr.strip() else "no-credential"
-    value = res.stdout
-    if value.endswith(b"\r\n"):
-        value = value[:-2]
-    elif value.endswith(b"\n"):
-        value = value[:-1]
-    if not _forti_valid_secret(value):
-        return b"", "keyring-unavailable"
-    return value, ""
-
-
-def secret_tool_store(identity, password):
-    tool = shutil.which("secret-tool")
-    if not tool:
-        return False
-    label = f"TunnelHub Forti {identity['profile']} ({identity['username']}@{identity['host']})"
-    try:
-        res = subprocess.run([tool, "store", "--label", label, *_forti_secret_attrs(identity)],
-                             input=password, capture_output=True, timeout=FORTI_KEYRING_TIMEOUT)
-    except Exception:
-        return False
-    return res.returncode == 0
-
-
-def secret_tool_clear(identity):
-    tool = shutil.which("secret-tool")
-    if not tool:
-        return False
-    try:
-        res = subprocess.run([tool, "clear", *_forti_secret_attrs(identity)],
-                             capture_output=True, timeout=FORTI_KEYRING_TIMEOUT)
-    except Exception:
-        return False
-    # secret-tool returns 1 when no matching item exists; only stderr indicates a real failure.
-    return res.returncode == 0 or not res.stderr.strip()
+def _forti_extra(identity):
+    return {"host": identity["host"], "username": identity["username"]}
 
 
 def forti_credential_lookup(name):
     identity = forti_identity(name)
     if not identity:
         return b"", "identity-unavailable"
-    return secret_tool_lookup(identity)
+    return secrets_store.lookup("forti", name, _forti_extra(identity))
 
 
 def forti_credential_status(name):
@@ -574,18 +564,25 @@ def forti_credential_status(name):
     if not identity:
         return {"profile": name, "identity": None, "saved": False, "length": 0,
                 "reason": "identity-unavailable"}
-    password, reason = secret_tool_lookup(identity)
+    password, reason = secrets_store.lookup("forti", name, _forti_extra(identity))
     return {"profile": name, "identity": identity, "saved": bool(password),
             "length": len(password), "reason": "" if password else reason}
 
 
-def forti_credential_store(name, password):
+def forti_credential_store(name, password, allow_plaintext=False):
     identity = forti_identity(name)
     if not identity:
         return "Password was not saved: Forti profile identity is unavailable."
-    secret_tool_clear(identity)
-    if secret_tool_store(identity, password):
+    if allow_plaintext and not secrets_store.keyring_available():
+        try:
+            secrets_store.record_consent()
+        except OSError:
+            return "Password was not saved: the unencrypted secret store is not writable."
+    result = secrets_store.store("forti", name, password, _forti_extra(identity), plaintext=allow_plaintext)
+    if result["saved"]:
         return ""
+    if result["reason"] == "consent-required":
+        return "Password was not saved: GNOME Keyring is unavailable and unencrypted storage was not allowed."
     return "Password was not saved: GNOME Keyring is unavailable."
 
 
@@ -593,7 +590,7 @@ def forti_credential_clear(name):
     identity = forti_identity(name)
     if not identity:
         raise ValueError("Could not resolve the Forti profile identity; the profile was not deleted so a saved password cannot be orphaned.")
-    if not secret_tool_clear(identity):
+    if not secrets_store.clear("forti", name, _forti_extra(identity)):
         raise ValueError("Could not remove the saved Forti password; the profile was not deleted.")
 
 
@@ -1124,7 +1121,7 @@ def _forti_stop_child(pid):
         pass
 
 
-def forti_connect_pty(name, password, store=False):
+def forti_connect_pty(name, password, store=False, allow_plaintext=False):
     import select
     if not password:
         record = forti_attempt_start(name, "connecting", FORTI_CONNECT_TIMEOUT)
@@ -1249,7 +1246,7 @@ def forti_connect_pty(name, password, store=False):
             write_forti_state(True)
             forti_attempt_finish(record, "connected")
             if store:
-                warning = forti_credential_store(name, password)
+                warning = forti_credential_store(name, password, allow_plaintext)
                 if warning:
                     forti_attempt_update(record, warning=warning)
             replaced = False
@@ -1415,9 +1412,11 @@ def forti_disconnect_bg():
                          error=error, cleanup_required=cleanup)
 
 
-def _spawn_forti_helper(action, name, password):
-    process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), action, name],
-                               stdin=subprocess.PIPE, start_new_session=True,
+def _spawn_forti_helper(action, name, password, allow_plaintext=False):
+    args = [sys.executable, str(Path(__file__).resolve()), action, name]
+    if allow_plaintext:
+        args.append("1")
+    process = subprocess.Popen(args, stdin=subprocess.PIPE, start_new_session=True,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         process.stdin.write(password + b"\n")
@@ -1449,7 +1448,7 @@ def _forti_prepare_connect():
     raise ValueError("FortiClient kept a stale connection state after cleanup. Refresh and retry.")
 
 
-def forti_connect_with_password(name, password):
+def forti_connect_with_password(name, password, allow_plaintext=False):
     require("forticlient")
     if name not in forti_list():
         raise ValueError(f"FortiClient profile '{name}' is not registered.")
@@ -1457,7 +1456,7 @@ def forti_connect_with_password(name, password):
         raise ValueError("Forti password is empty or contains invalid characters.")
     _forti_require_idle()
     _forti_prepare_connect()
-    _spawn_forti_helper("bg-connect-forti-pass", name, password)
+    _spawn_forti_helper("bg-connect-forti-pass", name, password, allow_plaintext)
     return {"message": f"Connecting to FortiClient '{name}'…"}
 
 
@@ -1514,7 +1513,7 @@ def forti_create(name, host, port, username):
         identity = forti_identity(name)
         if identity is None:
             raise ValueError("Could not resolve the existing Forti profile identity; the profile was not replaced, so a saved password cannot be orphaned.")
-        if not secret_tool_clear(identity):
+        if not secrets_store.clear("forti", name, _forti_extra(identity)):
             raise ValueError("Could not remove the existing saved Forti password; the profile was not replaced.")
         subprocess.run([client, "vpn", "remove", name], capture_output=True, text=True, timeout=5)
         forti_pin_clear(name)
@@ -1855,7 +1854,8 @@ def main():
         forti_connect_pty(sys.argv[2], read_forti_password_from_stdin(), store=False)
         return {"done": True}
     if action == "bg-connect-forti-pass":
-        forti_connect_pty(sys.argv[2], read_forti_password_from_stdin(), store=True)
+        forti_connect_pty(sys.argv[2], read_forti_password_from_stdin(), store=True,
+                          allow_plaintext=len(sys.argv) > 3 and sys.argv[3] == "1")
         return {"done": True}
     if action == "connect-forti":
         return forti_connect(sys.argv[2])
@@ -1878,11 +1878,19 @@ def main():
     if action == "forget-forti-cert":
         return {"profile": sys.argv[2], "forgotten": forti_pin_clear(sys.argv[2])}
     if action == "connect-forti-pass":
-        return forti_connect_with_password(sys.argv[2], read_forti_password_from_stdin())
+        return forti_connect_with_password(sys.argv[2], read_forti_password_from_stdin(),
+                                           allow_plaintext=len(sys.argv) > 3 and sys.argv[3] == "1")
     if action == "list":
         return {**forti_profile_payload(), "azure": load()}
     if action == "nm-types":
         return nm_vpn_types()
+    if action == "secret-status":
+        return secret_overview()
+    if action == "secret-consent":
+        secrets_store.record_consent()
+        return {"plaintextAllowed": True, "plaintextPath": str(secrets_store.PLAINTEXT_FILE)}
+    if action == "secret-clear":
+        return secret_clear(sys.argv[2], sys.argv[3])
     if action == "credential-status":
         return forti_credential_status(sys.argv[2])
     if action == "details-nm":
