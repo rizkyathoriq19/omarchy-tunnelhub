@@ -58,52 +58,34 @@ print(json.dumps(secrets_store.lookup("nm", {self.ident!r}, {{"secret": "cert-pa
         self.assertTrue(lines[2])
         self.assertEqual(lines[3], "no-credential")
 
-    def test_no_keyring_without_consent_is_refused(self):
+    def test_no_keyring_writes_no_password_file(self):
         bindir = tempfile.mkdtemp(prefix="tunnelhub-bin-")
         self.addCleanup(shutil.rmtree, bindir, True)
         code = """
 import json
 import secrets_store
-print(json.dumps(secrets_store.store("nm", "no-consent", "pw", plaintext=True)))
-"""
-        out = run_module(code, self.state, path=bindir)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        result = json.loads(out.stdout)
-        self.assertFalse(result["saved"])
-        self.assertEqual(result["reason"], "consent-required")
-        self.assertFalse((Path(self.state) / "airzy.vpn/secrets.json").exists())
-
-    def test_plaintext_round_trip_with_consent(self):
-        bindir = tempfile.mkdtemp(prefix="tunnelhub-bin-")
-        self.addCleanup(shutil.rmtree, bindir, True)
-        code = """
-import json
-import secrets_store
-print(json.dumps(secrets_store.store("forti", "plain", "pw-file", {"host": "vpn.example", "username": "u"}, plaintext=True)))
-secrets_store.record_consent()
-print(json.dumps(secrets_store.store("forti", "plain", "pw-file", {"host": "vpn.example", "username": "u"}, plaintext=True)))
-value, reason = secrets_store.lookup("forti", "plain", {"host": "vpn.example", "username": "u"})
-print(json.dumps([value.decode(), reason]))
+print(json.dumps(secrets_store.store("forti", "plain", "pw-file", {"host": "vpn.example", "username": "u"})))
+print(json.dumps(secrets_store.lookup("forti", "plain", {"host": "vpn.example", "username": "u"})[1]))
 """
         out = run_module(code, self.state, path=bindir)
         self.assertEqual(out.returncode, 0, out.stderr)
         lines = [json.loads(line) for line in out.stdout.strip().splitlines()]
-        self.assertEqual(lines[0]["reason"], "consent-required")
-        self.assertEqual(lines[1]["backend"], "plaintext")
-        self.assertEqual(lines[2], ["pw-file", ""])
-        stored = Path(self.state) / "airzy.vpn/secrets.json"
-        self.assertTrue(stored.exists())
-        self.assertEqual(stat.S_IMODE(stored.stat().st_mode), 0o600)
-        self.assertNotIn("pw-file", json.loads((Path(self.state) / "airzy.vpn/secret-policy.json").read_text()).__str__())
+        self.assertFalse(lines[0]["saved"])
+        self.assertEqual(lines[0]["reason"], "keyring-unavailable")
+        self.assertEqual(lines[1], "keyring-unavailable")
+        self.assertFalse((Path(self.state) / "airzy.vpn" / "secrets.json").exists())
+        self.assertFalse(any(p.name == "secrets.json" for p in Path(self.state).rglob("*")))
 
-    def test_consent_action_and_status(self):
+    def test_nm_storage_consent_action_and_status(self):
         before = json.loads(run_cli(["secret-status"], self.state).stdout)
-        self.assertFalse(before["plaintextAllowed"])
+        self.assertFalse(before["nmStorageAllowed"])
         after = json.loads(run_cli(["secret-consent"], self.state).stdout)
-        self.assertTrue(after["plaintextAllowed"])
+        self.assertTrue(after["nmStorageAllowed"])
         status = json.loads(run_cli(["secret-status"], self.state).stdout)
-        self.assertTrue(status["plaintextAllowed"])
-        self.assertEqual(stat.S_IMODE((Path(self.state) / "airzy.vpn/secret-policy.json").stat().st_mode), 0o600)
+        self.assertTrue(status["nmStorageAllowed"])
+        policy = Path(self.state) / "airzy.vpn/secret-policy.json"
+        self.assertEqual(stat.S_IMODE(policy.stat().st_mode), 0o600)
+        self.assertNotIn("password", policy.read_text().lower())
 
     def test_status_never_returns_the_secret(self):
         code = """
@@ -119,44 +101,27 @@ print("ok")
         self.assertNotIn("super-secret", status.stdout)
         self.assertIn("backend", status.stdout)
 
-    def test_corrupt_plaintext_file_is_not_a_crash(self):
-        target = Path(self.state) / "airzy.vpn"
-        target.mkdir(parents=True)
-        (target / "secrets.json").write_text("{not json")
-        (target / "secret-policy.json").write_text(json.dumps({"plaintextAllowed": True}))
-        code = """
-import json
-import secrets_store
-value, reason = secrets_store.lookup("forti", "x", {"host": "h", "username": "u"})
-print(json.dumps([value.decode("utf-8", "replace"), reason]))
-"""
-        out = run_module(code, self.state)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        value, reason = json.loads(out.stdout)
-        self.assertEqual(value, "")
-        self.assertEqual(reason, "store-unreadable")
-
     def test_state_directory_is_tightened(self):
         target = Path(self.state) / "airzy.vpn"
         target.mkdir(parents=True)
         os.chmod(target, 0o755)
         code = """
 import secrets_store
-secrets_store.record_consent()
+secrets_store.allow_nm_storage()
 print("ok")
 """
         out = run_module(code, self.state)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o700)
 
-    def test_symlinked_store_is_refused(self):
+    def test_symlinked_policy_is_refused(self):
         target = Path(self.state) / "airzy.vpn"
         target.mkdir(parents=True)
         elsewhere = Path(self.state) / "elsewhere.json"
-        elsewhere.write_text(json.dumps({"plaintextAllowed": True}))
+        elsewhere.write_text(json.dumps({"networkManagerStorageAllowed": True}))
         (target / "secret-policy.json").symlink_to(elsewhere)
         status = json.loads(run_cli(["secret-status"], self.state).stdout)
-        self.assertFalse(status["plaintextAllowed"])
+        self.assertFalse(status["nmStorageAllowed"])
 
     def test_networkmanager_store_reads_back(self):
         profile = "zz-secret-test-" + uuid.uuid4().hex[:8]
