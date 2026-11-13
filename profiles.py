@@ -1913,6 +1913,12 @@ def main():
 
 
 if __name__ == "__main__":
+    # Helpers on this path hold profile passwords in memory; never write a core.
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ImportError, OSError, ValueError):
+        pass
     try:
         if len(sys.argv) > 1 and sys.argv[1] == "run":
             try:
