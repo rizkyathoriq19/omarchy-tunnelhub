@@ -99,7 +99,7 @@ Item {
   readonly property bool nmActive: nmStateKnown && nmUuid !== ""
   readonly property string azureDisplayState: azureOperation.stopping ? "disconnecting" : (azurePending ? "connecting" : azure.state)
   readonly property string activeProfile: azure.connected ? (azure.path ? azure.path.split("/").pop() : "VPN") : (forti.connected ? forti.profile : nmProfile)
-  readonly property string activeType: azure.connected ? "Azure OpenP2S" : (forti.connected ? "FortiClient SSL-VPN" : (nmType ? profileTypeLabel(nmType) + " (NetworkManager)" : ""))
+  readonly property string activeType: azure.connected ? "Azure OpenP2S" : (forti.connected ? "FortiClient SSL-VPN" : (nmType ? profileTypeLabel(nmType, nmServiceType) + " (NetworkManager)" : ""))
   readonly property string activeUuid: azure.connected ? "" : (forti.connected ? "" : nmUuid)
   readonly property string tunnelIp: azure.connected ? azure.address : (forti.connected ? forti.address : nmTunnelIp)
   readonly property string interfaceName: azure.connected ? azure.interface : (forti.connected ? forti.interface : nmInterface)
@@ -423,6 +423,8 @@ Item {
   }
   property string nmProfile: ""
   property string nmType: ""
+  property string nmServiceType: ""
+  property var nmServiceTypes: ({})
   property string nmUuid: ""
   property var _nmActiveUuids: []
   property string _nmAttemptUuid: ""
@@ -441,6 +443,7 @@ Item {
     nmUuid = ""
     nmProfile = ""
     nmType = ""
+    nmServiceType = ""
     nmTunnelIp = ""
     nmInterface = ""
   }
@@ -505,6 +508,7 @@ Item {
   function refresh() {
     pollAzure()
     reloadAzureRegistry()
+    loadNmServiceTypes()
     if (refreshing)
       return
 
@@ -725,7 +729,8 @@ Item {
         name: name,
         uuid: uuid,
         type: type,
-        label: profileTypeLabel(type)
+        serviceType: root.nmServiceTypes[uuid] || "",
+        label: profileTypeLabel(type, root.nmServiceTypes[uuid] || "")
       })
     }
 
@@ -736,14 +741,73 @@ Item {
     return result
   }
 
-  function profileTypeLabel(type) {
+  function profileTypeLabel(type, serviceType) {
     if (type === "wireguard")
       return "WireGuard"
 
-    if (type === "vpn")
+    if (type === "vpn") {
+      var service = String(serviceType || "").toLowerCase()
+      if (service.indexOf("openvpn") !== -1)
+        return "OpenVPN"
+      if (service.indexOf("sstp") !== -1)
+        return "SSTP"
       return "VPN"
+    }
 
     return type
+  }
+
+  function nmBadgeText(profile) {
+    if (!profile)
+      return "VPN"
+    if (profile.type === "wireguard")
+      return "WG"
+    var service = String(profile.serviceType || nmServiceTypes[profile.uuid] || "").toLowerCase()
+    if (service.indexOf("openvpn") !== -1)
+      return "OVPN"
+    if (service.indexOf("sstp") !== -1)
+      return "SSTP"
+    return "VPN"
+  }
+
+  function loadNmServiceTypes() {
+    if (serviceTypesProcess.running)
+      return
+    serviceTypesProcess.running = true
+  }
+
+  function applyNmServiceTypes() {
+    var updated = profiles.slice()
+    var changed = false
+    for (var i = 0; i < updated.length; i++) {
+      var entry = updated[i]
+      var service = nmServiceTypes[entry.uuid] || ""
+      if (entry.serviceType !== service || entry.label !== profileTypeLabel(entry.type, service)) {
+        updated[i] = { name: entry.name, uuid: entry.uuid, type: entry.type, serviceType: service, label: profileTypeLabel(entry.type, service) }
+        changed = true
+      }
+    }
+    if (changed)
+      profiles = updated
+    if (nmUuid && nmServiceTypes[nmUuid] !== undefined && nmServiceType !== nmServiceTypes[nmUuid])
+      nmServiceType = nmServiceTypes[nmUuid]
+  }
+
+  Process {
+    id: serviceTypesProcess
+    command: ["/usr/bin/python3", decodeURIComponent(Qt.resolvedUrl("profiles.py").toString().replace(/^file:\/\//, "")), "nm-types"]
+    stdout: StdioCollector { id: serviceTypesOutput; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode !== 0)
+        return
+      try {
+        var result = JSON.parse(String(serviceTypesOutput.text || ""))
+        if (result.nmTypes !== undefined && result.nmTypes !== null) {
+          root.nmServiceTypes = result.nmTypes
+          root.applyNmServiceTypes()
+        }
+      } catch (e) { /* keep last known types; next refresh retries */ }
+    }
   }
 
   function parseActive(raw) {
@@ -756,6 +820,7 @@ Item {
     nmProfile = ""
     nmUuid = ""
     nmType = ""
+    nmServiceType = ""
 
     for (var i = 0; i < lines.length; i++) {
       var line = lines[i]
@@ -776,6 +841,7 @@ Item {
       nmType = type
       nmUuid = parts[parts.length - 2]
       nmProfile = parts.slice(0, parts.length - 2).join(":")
+      nmServiceType = nmServiceTypes[nmUuid] || ""
       break
     }
     if (previousUuid !== nmUuid) { nmTunnelIp = ""; nmInterface = "" }
