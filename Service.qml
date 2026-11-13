@@ -15,13 +15,47 @@ Item {
   readonly property string authRequest: fortiRequest || certificateRequest || permissionRequest
   readonly property bool certificatePrompt: certificateRequest !== ""
   readonly property bool fortiPrompt: fortiRequest !== ""
+  property var secretStatus: ({backend: "unknown", plaintextAllowed: false, plaintextPath: "", saved: {forti: {}, nm: {}}})
+  property bool secretSaveChoice: true
+  property bool secretChoiceInitialized: false
+  readonly property bool secretKeyring: secretStatus.backend === "keyring"
+  readonly property bool canSaveSecret: secretKeyring || secretSaveChoice || secretStatus.plaintextAllowed === true
+  readonly property bool secretConsentNeeded: (certificateRequest !== "" || fortiRequest !== "") && secretStatus.backend === "none" && secretStatus.plaintextAllowed !== true
+  function savedSecret(kind, ident) {
+    var saved = (secretStatus.saved || {})[kind] || {}
+    return saved[ident] === true
+  }
+  function forgetSecret(kind, ident) {
+    profileAction("secret-clear", kind, undefined, ident)
+  }
+  function refreshSecretStatus() {
+    if (!secretStatusProcess.running) secretStatusProcess.running = true
+  }
+  Process {
+    id: secretStatusProcess
+    command: ["/usr/bin/python3", decodeURIComponent(Qt.resolvedUrl("profiles.py").toString().replace(/^file:\/\//, "")), "secret-status"]
+    stdout: StdioCollector { id: secretStatusOutput; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) return
+      try {
+        var result = JSON.parse(String(secretStatusOutput.text || ""))
+        if (result.backend === undefined) return
+        root.secretStatus = result
+        if (!root.secretChoiceInitialized) {
+          root.secretChoiceInitialized = true
+          root.secretSaveChoice = result.backend === "keyring" || result.plaintextAllowed === true
+        }
+      } catch (e) { /* keep last known status */ }
+    }
+  }
   function respondAuth(value) {
+    var save = root.secretSaveChoice && root.canSaveSecret
     if (fortiRequest) {
       var name = fortiRequest
       fortiRequest = ""
       fortiRequestReason = ""
       if (value && value.length > 0) {
-        profileAction("connect-forti-pass", name, value)
+        profileAction("connect-forti-pass", name, value, save ? "1" : "0")
       }
       return
     }
@@ -30,7 +64,7 @@ Item {
     certificateRequest = ""
     if (!certificateProcess.running) return
     if (value && value.length <= 4092 && !/[\x00-\x1f\x7f]/.test(value))
-      certificateProcess.write(ident + "\t" + value + "\n")
+      certificateProcess.write(ident + "\t" + value + "\t" + (save ? "1" : "0") + "\n")
     else { _nmAttemptCancelled = true; certificateProcess.write(ident + "\n") }
   }
   function cancelAuth() {
@@ -343,7 +377,7 @@ Item {
   }
   readonly property bool importing: importProcess.running
 
-  function profileAction(action, path, input) {
+  function profileAction(action, path, input, extra) {
     if (importProcess.running || actionRunning) return
     if (action === "launch" && (!azureOperationKnown || azureOperation.running || azureOperation.stopping || azure.state !== "disconnected")) return
     if (action === "launch" || action === "disconnect" || action === "connect-forti" || action === "connect-forti-pass" || action === "disconnect-forti") {
@@ -354,6 +388,7 @@ Item {
     importProcess.environment = {}
     var cmd = ["/usr/bin/python3", decodeURIComponent(Qt.resolvedUrl("profiles.py").toString().replace(/^file:\/\//, "")), action]
     if (path !== undefined) cmd.push(path)
+    if (extra !== undefined) cmd.push(extra)
     importProcess.command = cmd
     importProcess.running = true
     if (input !== undefined) {
@@ -509,6 +544,7 @@ Item {
     pollAzure()
     reloadAzureRegistry()
     loadNmServiceTypes()
+    refreshSecretStatus()
     if (refreshing)
       return
 
