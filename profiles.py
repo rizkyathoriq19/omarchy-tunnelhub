@@ -1842,14 +1842,331 @@ def disconnect():
     return {"message": "Disconnected."}
 
 
+GP_STORE = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "airzy.vpn/gp-profiles.json"
+GP_UNIT = "airzy-vpn-gp.service"
+GP_INTERFACE = "gp0"
+_GP_PORTAL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(?::[0-9]{1,5})?")
+
+
+def gp_normalize_portal(raw):
+    value = str(raw or "").strip()
+    if value.lower().startswith("https://"):
+        value = value[8:]
+    elif value.lower().startswith("http://"):
+        value = value[7:]
+    value = value.rstrip("/")
+    if not _GP_PORTAL_RE.fullmatch(value):
+        raise ValueError("Enter a GlobalProtect portal hostname, optionally followed by :port (no path).")
+    return value
+
+
+def gp_installed():
+    return shutil.which("gpclient") is not None
+
+
+def gp_load():
+    if not GP_STORE.exists():
+        return []
+    data = json.loads(GP_STORE.read_text())
+    if not isinstance(data, list) or any(not isinstance(p, str) or not _GP_PORTAL_RE.fullmatch(p) for p in data):
+        raise ValueError("Invalid GlobalProtect profile registry; restore or remove the registry file.")
+    return data
+
+
+def gp_save(portals):
+    GP_STORE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, temp = tempfile.mkstemp(dir=GP_STORE.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            json.dump(portals, stream)
+        os.replace(temp, GP_STORE)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def gp_register(portal):
+    portal = gp_normalize_portal(portal)
+    portals = gp_load()
+    if portal not in portals:
+        portals.append(portal)
+        gp_save(portals)
+    return portals
+
+
+def form_gp():
+    picker = subprocess.run([
+        require("zenity"), "--forms", "--title=Add GlobalProtect VPN Profile",
+        "--text=Enter GlobalProtect Portal Hostname",
+        "--add-entry=Portal Hostname (e.g. vpn.company.com)",
+    ], capture_output=True, text=True, timeout=60)
+    if picker.returncode == 1:
+        return {"cancelled": True}
+    if picker.returncode:
+        raise ValueError("Dialog failed. Check zenity.")
+    portal = gp_normalize_portal(picker.stdout.strip().split("|", 1)[0])
+    return {"gp": gp_register(portal), "message": f"GlobalProtect profile '{portal}' added."}
+
+
+def gp_control(action, check=True):
+    result = subprocess.run([require("systemctl"), "--user", action, GP_UNIT],
+                            capture_output=True, text=True, timeout=40 if action == "stop" else 5)
+    if check and result.returncode:
+        raise ValueError("GlobalProtect process control failed. Refresh status and retry.")
+    return result
+
+
+def gp_supervisor_portal(pid):
+    try:
+        proc = Path("/proc") / str(int(pid))
+        if int(pid) <= 0 or proc.stat().st_uid != os.getuid():
+            return ""
+        args = proc.joinpath("cmdline").read_bytes().decode().split("\x00")
+        if (len(args) == 5 and args[0] == "/usr/bin/python3"
+                and args[1] == str(Path(__file__).resolve()) and args[2] == "run-gp"
+                and args[3] in gp_load()):
+            return args[3]
+    except (OSError, ValueError, UnicodeError):
+        pass
+    return ""
+
+
+def get_gp_interface():
+    try:
+        ip = require("ip")
+        res = subprocess.run([ip, "-j", "addr", "show", "dev", GP_INTERFACE],
+                             capture_output=True, text=True, timeout=2)
+        if res.returncode == 0:
+            for dev in json.loads(res.stdout):
+                addrs = dev.get("addr_info", [])
+                ipv4 = next((a.get("local", "") for a in addrs if a.get("family") == "inet"), "")
+                if ipv4:
+                    return GP_INTERFACE, ipv4
+                ipv6 = next((a.get("local", "") for a in addrs if a.get("family") == "inet6" and a.get("scope") == "global"), "")
+                if ipv6:
+                    return GP_INTERFACE, ipv6
+    except Exception:
+        pass
+    return "", ""
+
+
+def gp_operation_status():
+    empty = {"known": False, "running": False, "stopping": False, "portal": "",
+             "error": "GlobalProtect process status unavailable. Check the systemd user manager and refresh."}
+    try:
+        result = subprocess.run([require("systemctl"), "--user", "show", GP_UNIT,
+                                 "--property=LoadState,ActiveState,SubState,Result,ExecMainStatus,MainPID"],
+                                capture_output=True, text=True, timeout=5)
+        if result.returncode:
+            return empty
+        values = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        if (values.get("LoadState") not in ("loaded", "not-found")
+                or values.get("ActiveState") not in ("active", "activating", "deactivating", "inactive", "failed")
+                or not values.get("SubState") or "Result" not in values
+                or not values.get("ExecMainStatus", "").isdecimal()
+                or not values.get("MainPID", "").isdecimal()):
+            return empty
+        active_state = values.get("ActiveState")
+        failed = active_state == "failed"
+        code = values.get("ExecMainStatus", "")
+        error = ""
+        if failed:
+            error = {"6": "GlobalProtect GUI prerequisites are missing. Check gpclient, sudo, and display."}.get(
+                code, "GlobalProtect connection failed or sudo/browser sign-in was cancelled.")
+        portal = gp_supervisor_portal(values.get("MainPID", "0")) if active_state in ("active", "activating", "deactivating") else ""
+        return {"known": True, "running": active_state in ("active", "activating"),
+                "stopping": active_state == "deactivating", "portal": portal, "error": error}
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return empty
+
+
+def gp_status():
+    installed = gp_installed()
+    op = gp_operation_status()
+    ifname, address = get_gp_interface()
+    if ifname and address:
+        state = "disconnecting" if op["stopping"] else "connected"
+    elif op["stopping"]:
+        state = "disconnecting"
+    elif op["running"]:
+        state = "connecting"
+    elif not op["known"]:
+        state = "unknown"
+    else:
+        state = "disconnected"
+    portal = op["portal"]
+    if state == "connected" and not portal:
+        try:
+            portals = gp_load()
+            if len(portals) == 1:
+                portal = portals[0]
+        except ValueError:
+            pass
+    return {
+        "installed": installed,
+        "known": op["known"],
+        "state": state,
+        "connected": state == "connected",
+        "running": op["running"],
+        "stopping": op["stopping"],
+        "portal": portal,
+        "interface": ifname if state == "connected" else "",
+        "address": address if state == "connected" else "",
+        "error": op["error"] if state != "connected" else "",
+    }
+
+
+def gp_remove(portal):
+    portals = gp_load()
+    if portal not in portals:
+        raise ValueError("GlobalProtect profile is not registered.")
+    current = gp_status()
+    if current["running"] or current["stopping"] or (current["connected"] and current["portal"] == portal):
+        raise ValueError("Disconnect GlobalProtect before removing a profile.")
+    portals = [p for p in portals if p != portal]
+    gp_save(portals)
+    return {"gp": portals, "message": f"GlobalProtect profile '{portal}' removed."}
+
+
+def launch_gp(portal):
+    if portal not in gp_load():
+        raise ValueError("GlobalProtect portal is not registered. Add it first.")
+    require("gpclient")
+    gui_environment()
+    current = gp_status()
+    if not current["known"] or current["running"] or current["stopping"] or current["connected"]:
+        raise ValueError("GlobalProtect is active, starting, or status unavailable. Disconnect before connecting again.")
+    gp_control("reset-failed", check=False)
+    args = [require("systemd-run"), "--user", "--quiet", "--unit=" + GP_UNIT,
+            "--service-type=exec", "--expand-environment=no",
+            "--property=KillMode=mixed", "--property=TimeoutStopSec=30",
+            "--property=StandardOutput=null", "--property=StandardError=null"]
+    for key in ("HOME", "PATH", "DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR",
+                "DBUS_SESSION_BUS_ADDRESS", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME",
+                "XDG_DATA_DIRS", "XDG_DATA_HOME", "XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP",
+                "DESKTOP_SESSION", "BROWSER", "MOZ_ENABLE_WAYLAND", "XAUTHORITY"):
+        if key in os.environ:
+            args.append("--setenv=" + key + "=" + os.environ[key])
+    args += ["/usr/bin/python3", str(Path(__file__).resolve()), "run-gp", portal]
+    result = subprocess.run(args, capture_output=True, text=True, timeout=15)
+    if result.returncode:
+        raise ValueError("Could not start GlobalProtect user process. Check the systemd user manager.")
+    return {"message": f"Connecting to GlobalProtect '{portal}'…"}
+
+
+def supervise_gp(command):
+    """Run root gpclient inside a PTY so SIGTERM delivers Ctrl+C without a second sudo prompt."""
+    import fcntl
+    import pty
+    import select
+    import termios
+
+    stopping = False
+
+    def stop(signum, frame):
+        nonlocal stopping
+        stopping = True
+
+    previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    master, slave = pty.openpty()
+    child = None
+    try:
+        def _set_ctty():
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+        with Lease() as capability:
+            env = gui_environment()
+            env["AIRZY_VPN_PERMISSION"] = capability
+            child = subprocess.Popen(
+                command, env=env, stdin=slave, stdout=slave, stderr=slave,
+                start_new_session=True, preexec_fn=_set_ctty, close_fds=True,
+            )
+            os.close(slave)
+            slave = -1
+            sent_ctrl_c = 0.0
+            while True:
+                if stopping and (sent_ctrl_c == 0.0 or time.monotonic() - sent_ctrl_c >= 3.0):
+                    try:
+                        os.write(master, b"\x03")
+                    except OSError:
+                        pass
+                    sent_ctrl_c = time.monotonic()
+                if child.poll() is not None:
+                    break
+                try:
+                    ready, _, _ = select.select([master], [], [], 0.2)
+                    if ready:
+                        if not os.read(master, 4096):
+                            break
+                except OSError:
+                    break
+            code = child.wait()
+            if stopping:
+                return 0
+            return code if code >= 0 else 1
+    finally:
+        if slave >= 0:
+            try:
+                os.close(slave)
+            except OSError:
+                pass
+        try:
+            os.close(master)
+        except OSError:
+            pass
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def run_gp_connection(portal):
+    if portal not in gp_load():
+        raise ValueError("GlobalProtect portal is not registered.")
+    command = [
+        require("/usr/bin/sudo"), "-A", "--",
+        require("gpclient"), "connect",
+        "--browser=default", "--auto-gateway",
+        "--interface", GP_INTERFACE, portal,
+    ]
+    return supervise_gp(command)
+
+
+def disconnect_gp():
+    current = gp_status()
+    if current["running"] or current["stopping"]:
+        gp_control("stop")
+        end = time.monotonic() + 5.0
+        while time.monotonic() < end:
+            if not get_gp_interface()[0]:
+                break
+            time.sleep(0.2)
+    if get_gp_interface()[0]:
+        code = supervise([require("/usr/bin/sudo"), "-A", "--", require("gpclient"), "disconnect", "--wait", "15"])
+        if code and get_gp_interface()[0]:
+            raise ValueError("GlobalProtect disconnect failed or sudo was cancelled. Refresh and retry.")
+    gp_control("reset-failed", check=False)
+    return {"message": "Disconnected."}
+
+
 def main():
     action = sys.argv[1]
     if action == "status":
-        res = dict(status(), operation=operation_status(), forti=forti_status())
+        res = dict(status(), operation=operation_status(), forti=forti_status(), gp=gp_status())
         check_and_heal_network(res)
         return res
     if action == "disconnect":
         return disconnect()
+    if action == "form-gp":
+        return form_gp()
+    if action == "add-gp":
+        portal = gp_normalize_portal(sys.argv[2])
+        return {"gp": gp_register(portal), "message": f"GlobalProtect profile '{portal}' added."}
+    if action == "launch-gp":
+        return launch_gp(sys.argv[2])
+    if action == "disconnect-gp":
+        return disconnect_gp()
+    if action == "remove-gp":
+        return gp_remove(sys.argv[2])
     if action == "bg-connect-forti":
         forti_connect_pty(sys.argv[2], read_forti_password_from_stdin(), store=False)
         return {"done": True}
@@ -1881,7 +2198,7 @@ def main():
         return forti_connect_with_password(sys.argv[2], read_forti_password_from_stdin(),
                                            allow_plaintext=len(sys.argv) > 3 and sys.argv[3] == "1")
     if action == "list":
-        return {**forti_profile_payload(), "azure": load()}
+        return {**forti_profile_payload(), "azure": load(), "gp": gp_load()}
     if action == "nm-types":
         return nm_vpn_types()
     if action == "secret-status":
@@ -1923,6 +2240,11 @@ if __name__ == "__main__":
         if len(sys.argv) > 1 and sys.argv[1] == "run":
             try:
                 sys.exit(run_connection(sys.argv[2]))
+            except (OSError, ValueError, IndexError):
+                sys.exit(6)
+        if len(sys.argv) > 1 and sys.argv[1] == "run-gp":
+            try:
+                sys.exit(run_gp_connection(sys.argv[2]))
             except (OSError, ValueError, IndexError):
                 sys.exit(6)
         print(json.dumps(main()))
