@@ -397,7 +397,7 @@ Panel {
               Text {
                 width: parent.width
                 visible: vpn.secretConsentNeeded
-                text: "GNOME Keyring is unavailable. This choice stores the password unencrypted in " + vpn.secretStatus.plaintextPath + " with mode 0600. For an encrypted private key, a stored passphrase beside the key removes the benefit of that encryption. Leave it off to use the password once."
+                text: "GNOME Keyring is unavailable. This choice stores the password in NetworkManager's own keyfile, which only root can read, and stops the ask-every-time prompt. For an encrypted private key, a stored passphrase beside the key removes the benefit of that encryption. Leave it off to use the password once."
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -440,10 +440,10 @@ Panel {
                   visible: vpn.secretConsentNeeded
                   focusable: true
                   Accessible.role: Accessible.CheckBox
-                  Accessible.name: "Store this password unencrypted"
+                  Accessible.name: "Save this password in NetworkManager"
                   Accessible.checked: vpn.secretSaveChoice
                   Accessible.onPressAction: clicked()
-                  text: vpn.secretSaveChoice ? "Save unencrypted: on" : "Save unencrypted: off"
+                  text: vpn.secretSaveChoice ? "Save in NetworkManager: on" : "Save in NetworkManager: off"
                   onClicked: vpn.secretSaveChoice = !vpn.secretSaveChoice
                 }
                 Button {

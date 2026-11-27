@@ -15,12 +15,12 @@ Item {
   readonly property string authRequest: fortiRequest || certificateRequest || permissionRequest
   readonly property bool certificatePrompt: certificateRequest !== ""
   readonly property bool fortiPrompt: fortiRequest !== ""
-  property var secretStatus: ({backend: "unknown", plaintextAllowed: false, plaintextPath: "", saved: {forti: {}, nm: {}}})
+  property var secretStatus: ({backend: "unknown", nmStorageAllowed: false, saved: {forti: {}, nm: {}}})
   property bool secretSaveChoice: true
   property bool secretChoiceInitialized: false
   readonly property bool secretKeyring: secretStatus.backend === "keyring"
-  readonly property bool canSaveSecret: secretKeyring || secretSaveChoice || secretStatus.plaintextAllowed === true
-  readonly property bool secretConsentNeeded: (certificateRequest !== "" || fortiRequest !== "") && secretStatus.backend === "none" && secretStatus.plaintextAllowed !== true
+  readonly property bool canSaveSecret: secretKeyring || secretSaveChoice || secretStatus.nmStorageAllowed === true
+  readonly property bool secretConsentNeeded: certificateRequest !== "" && secretStatus.backend === "none" && secretStatus.nmStorageAllowed !== true
   function savedSecret(kind, ident) {
     var saved = (secretStatus.saved || {})[kind] || {}
     return saved[ident] === true
@@ -43,7 +43,7 @@ Item {
         root.secretStatus = result
         if (!root.secretChoiceInitialized) {
           root.secretChoiceInitialized = true
-          root.secretSaveChoice = result.backend === "keyring" || result.plaintextAllowed === true
+          root.secretSaveChoice = result.backend === "keyring" || result.nmStorageAllowed === true
         }
       } catch (e) { /* keep last known status */ }
     }

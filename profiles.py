@@ -206,8 +206,7 @@ def secret_overview():
         plugin_saved = bool(secrets_store.lookup("nm", uuid)[0])
         saved_nm[uuid] = plugin_saved or secrets_store.nm_status(uuid)["saved"]
     return {"backend": "keyring" if secrets_store.keyring_available() else "none",
-            "plaintextAllowed": secrets_store.consent_allowed(),
-            "plaintextPath": str(secrets_store.PLAINTEXT_FILE),
+            "nmStorageAllowed": secrets_store.nm_storage_allowed(),
             "saved": {"forti": saved_forti, "nm": saved_nm}}
 
 
@@ -569,20 +568,13 @@ def forti_credential_status(name):
             "length": len(password), "reason": "" if password else reason}
 
 
-def forti_credential_store(name, password, allow_plaintext=False):
+def forti_credential_store(name, password):
     identity = forti_identity(name)
     if not identity:
         return "Password was not saved: Forti profile identity is unavailable."
-    if allow_plaintext and not secrets_store.keyring_available():
-        try:
-            secrets_store.record_consent()
-        except OSError:
-            return "Password was not saved: the unencrypted secret store is not writable."
-    result = secrets_store.store("forti", name, password, _forti_extra(identity), plaintext=allow_plaintext)
+    result = secrets_store.store("forti", name, password, _forti_extra(identity))
     if result["saved"]:
         return ""
-    if result["reason"] == "consent-required":
-        return "Password was not saved: GNOME Keyring is unavailable and unencrypted storage was not allowed."
     return "Password was not saved: GNOME Keyring is unavailable."
 
 
@@ -1121,7 +1113,7 @@ def _forti_stop_child(pid):
         pass
 
 
-def forti_connect_pty(name, password, store=False, allow_plaintext=False):
+def forti_connect_pty(name, password, store=False):
     import select
     if not password:
         record = forti_attempt_start(name, "connecting", FORTI_CONNECT_TIMEOUT)
@@ -1246,7 +1238,7 @@ def forti_connect_pty(name, password, store=False, allow_plaintext=False):
             write_forti_state(True)
             forti_attempt_finish(record, "connected")
             if store:
-                warning = forti_credential_store(name, password, allow_plaintext)
+                warning = forti_credential_store(name, password)
                 if warning:
                     forti_attempt_update(record, warning=warning)
             replaced = False
@@ -1412,11 +1404,9 @@ def forti_disconnect_bg():
                          error=error, cleanup_required=cleanup)
 
 
-def _spawn_forti_helper(action, name, password, allow_plaintext=False):
-    args = [sys.executable, str(Path(__file__).resolve()), action, name]
-    if allow_plaintext:
-        args.append("1")
-    process = subprocess.Popen(args, stdin=subprocess.PIPE, start_new_session=True,
+def _spawn_forti_helper(action, name, password):
+    process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), action, name],
+                               stdin=subprocess.PIPE, start_new_session=True,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         process.stdin.write(password + b"\n")
@@ -1448,7 +1438,7 @@ def _forti_prepare_connect():
     raise ValueError("FortiClient kept a stale connection state after cleanup. Refresh and retry.")
 
 
-def forti_connect_with_password(name, password, allow_plaintext=False):
+def forti_connect_with_password(name, password):
     require("forticlient")
     if name not in forti_list():
         raise ValueError(f"FortiClient profile '{name}' is not registered.")
@@ -1456,7 +1446,7 @@ def forti_connect_with_password(name, password, allow_plaintext=False):
         raise ValueError("Forti password is empty or contains invalid characters.")
     _forti_require_idle()
     _forti_prepare_connect()
-    _spawn_forti_helper("bg-connect-forti-pass", name, password, allow_plaintext)
+    _spawn_forti_helper("bg-connect-forti-pass", name, password)
     return {"message": f"Connecting to FortiClient '{name}'…"}
 
 
@@ -1854,8 +1844,7 @@ def main():
         forti_connect_pty(sys.argv[2], read_forti_password_from_stdin(), store=False)
         return {"done": True}
     if action == "bg-connect-forti-pass":
-        forti_connect_pty(sys.argv[2], read_forti_password_from_stdin(), store=True,
-                          allow_plaintext=len(sys.argv) > 3 and sys.argv[3] == "1")
+        forti_connect_pty(sys.argv[2], read_forti_password_from_stdin(), store=True)
         return {"done": True}
     if action == "connect-forti":
         return forti_connect(sys.argv[2])
@@ -1878,8 +1867,7 @@ def main():
     if action == "forget-forti-cert":
         return {"profile": sys.argv[2], "forgotten": forti_pin_clear(sys.argv[2])}
     if action == "connect-forti-pass":
-        return forti_connect_with_password(sys.argv[2], read_forti_password_from_stdin(),
-                                           allow_plaintext=len(sys.argv) > 3 and sys.argv[3] == "1")
+        return forti_connect_with_password(sys.argv[2], read_forti_password_from_stdin())
     if action == "list":
         return {**forti_profile_payload(), "azure": load()}
     if action == "nm-types":
@@ -1887,8 +1875,8 @@ def main():
     if action == "secret-status":
         return secret_overview()
     if action == "secret-consent":
-        secrets_store.record_consent()
-        return {"plaintextAllowed": True, "plaintextPath": str(secrets_store.PLAINTEXT_FILE)}
+        secrets_store.allow_nm_storage()
+        return {"nmStorageAllowed": True}
     if action == "secret-clear":
         return secret_clear(sys.argv[2], sys.argv[3])
     if action == "credential-status":
