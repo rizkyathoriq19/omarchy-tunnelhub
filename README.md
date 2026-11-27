@@ -45,6 +45,13 @@ Point-to-Site connections (OpenP2S), and FortiClient SSL-VPN profiles.
 - Arrow keys: select a profile; Enter: connect/disconnect selected profile.
 - `I` or **Import…**: import `.ovpn`, `.conf`, `.sconf`, or `.xml` (Auto-detects NetworkManager, Azure, or FortiClient).
 - `F` or **New Forti…**: add a FortiClient profile via interactive form.
+- `G` or **New GP (G)**: add a GlobalProtect portal hostname inline inside the
+  panel (stored in `$XDG_STATE_HOME/airzy.vpn/gp-profiles.json`, mode `0600`).
+  Toggling the profile runs `gpclient` inside the transient user unit
+  `airzy-vpn-gp.service` with external-browser SSO, automatic gateway selection,
+  dedicated `gp0` interface, and in-panel `sudo` askpass prompts (no terminal
+  window). The widget tracks live `gp0` status, tunnel IP, and disconnect/switch
+  controls. Install the Arch `globalprotect-openconnect` package.
 - `D`: disconnect selected profile; Escape: close panel.
 - Switching profiles disconnects the active profile before switching.
 ## NetworkManager certificate passwords

@@ -38,7 +38,8 @@ def supervisor(pid):
         args = Path('/proc', str(pid), 'cmdline').read_bytes().split(b'\0')
         return (args[:2] == [b'/usr/bin/python3', os.fsencode(BASE / 'profiles.py')]
                 and ((len(args) == 5 and args[2] == b'run' and args[3].startswith(b'/'))
-                     or (len(args) == 4 and args[2] == b'disconnect')))
+                     or (len(args) == 5 and args[2] == b'run-gp' and bool(args[3]))
+                     or (len(args) == 4 and args[2] in (b'disconnect', b'disconnect-gp'))))
     except OSError:
         return False
 

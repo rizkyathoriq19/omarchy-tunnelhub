@@ -107,11 +107,14 @@ Item {
   property var profiles: []
   property var azureProfiles: []
   property var fortiProfiles: []
+  property var gpProfiles: []
   property string fortiSwitchTarget: ""
   property string nmSwitchTarget: ""
   property string azureSwitchTarget: ""
+  property string gpSwitchTarget: ""
   property var azure: ({state: "unknown", connected: false, path: "", interface: "", address: ""})
   property var forti: ({installed: false, state: "disconnected", connected: false, profile: "", interface: "", address: "", error: "", passwordRequired: "", passwordReason: "", cleanupRequired: false, warning: "", attempt: {}})
+  property var gp: ({installed: false, known: false, state: "disconnected", connected: false, running: false, stopping: false, portal: "", interface: "", address: "", error: ""})
   property var azureOperation: ({known: false, running: null, stopping: null, error: ""})
   readonly property var fortiCertificate: {
     var cert = forti && forti.certificateRequired
@@ -130,16 +133,22 @@ Item {
   readonly property bool azureOperationKnown: azureOperation.known === true && typeof azureOperation.running === "boolean" && typeof azureOperation.stopping === "boolean"
   readonly property bool azurePending: azureOperation.running === true && !azure.connected
   readonly property bool fortiPending: ["connect-forti", "connect-forti-pass", "disconnect-forti"].indexOf(pendingAction) !== -1
+  readonly property bool gpPending: (gp.running === true && !gp.connected) || pendingAction === "launch-gp" || pendingAction === "disconnect-gp"
   readonly property bool nmActive: nmStateKnown && nmUuid !== ""
   readonly property string azureDisplayState: azureOperation.stopping ? "disconnecting" : (azurePending ? "connecting" : azure.state)
-  readonly property string activeProfile: azure.connected ? (azure.path ? azure.path.split("/").pop() : "VPN") : (forti.connected ? forti.profile : nmProfile)
-  readonly property string activeType: azure.connected ? "Azure OpenP2S" : (forti.connected ? "FortiClient SSL-VPN" : (nmType ? profileTypeLabel(nmType, nmServiceType) + " (NetworkManager)" : ""))
-  readonly property string activeUuid: azure.connected ? "" : (forti.connected ? "" : nmUuid)
-  readonly property string tunnelIp: azure.connected ? azure.address : (forti.connected ? forti.address : nmTunnelIp)
-  readonly property string interfaceName: azure.connected ? azure.interface : (forti.connected ? forti.interface : nmInterface)
-  readonly property string statusTitle: active ? "VPN Connected" : (azureDisplayState === "connecting" || forti.state === "connecting" || (certificateProcess.running && !_nmAttemptCancelled) ? "VPN Connecting" : (azureDisplayState === "disconnecting" || forti.state === "disconnecting" || pendingAction === "disconnect-forti" || (certificateProcess.running && _nmAttemptCancelled) ? "VPN Disconnecting" : (azure.state === "unknown" || !azureOperationKnown || !nmStateKnown ? "VPN Status Unknown" : "VPN Disconnected")))
-  readonly property int activeCount: (azure.connected ? 1 : 0) + (forti.connected ? 1 : 0) + (nmStateKnown ? _nmActiveUuids.length : 0)
+  readonly property string activeProfile: azure.connected ? (azure.path ? azure.path.split("/").pop() : "VPN") : (forti.connected ? forti.profile : (gp.connected ? (gp.portal || "GlobalProtect") : nmProfile))
+  readonly property string activeType: azure.connected ? "Azure OpenP2S" : (forti.connected ? "FortiClient SSL-VPN" : (gp.connected ? "GlobalProtect" : (nmType ? profileTypeLabel(nmType, nmServiceType) + " (NetworkManager)" : "")))
+  readonly property string activeUuid: azure.connected || forti.connected || gp.connected ? "" : nmUuid
+  readonly property string tunnelIp: azure.connected ? azure.address : (forti.connected ? forti.address : (gp.connected ? gp.address : nmTunnelIp))
+  readonly property string interfaceName: azure.connected ? azure.interface : (forti.connected ? forti.interface : (gp.connected ? gp.interface : nmInterface))
+  readonly property string statusTitle: active ? "VPN Connected" : (azureDisplayState === "connecting" || forti.state === "connecting" || gp.state === "connecting" || pendingAction === "launch-gp" || (certificateProcess.running && !_nmAttemptCancelled) ? "VPN Connecting" : (azureDisplayState === "disconnecting" || forti.state === "disconnecting" || gp.state === "disconnecting" || pendingAction === "disconnect-forti" || pendingAction === "disconnect-gp" || (certificateProcess.running && _nmAttemptCancelled) ? "VPN Disconnecting" : (azure.state === "unknown" || !azureOperationKnown || !nmStateKnown ? "VPN Status Unknown" : "VPN Disconnected")))
+  readonly property int activeCount: (azure.connected ? 1 : 0) + (forti.connected ? 1 : 0) + (gp.connected ? 1 : 0) + (nmStateKnown ? _nmActiveUuids.length : 0)
   readonly property string statusDescription: activeCount > 1 ? activeCount + " connections active" : (active ? "Connection active" : "")
+  function gpRowStatus(portal) {
+    if (gp.portal === portal) return gp.state || "disconnected"
+    if (gp.state === "unknown") return "unknown"
+    return "disconnected"
+  }
   function fortiRowStatus(name) {
     if (forti.attempt && forti.attempt.profile === name && forti.attempt.phase === "disconnecting") return "disconnecting"
     if (forti.connected && forti.profile === name) return "connected"
@@ -170,7 +179,7 @@ Item {
   Timer {
     interval: 2000
     repeat: true
-    running: root.fortiPending || root.forti.state === "connecting" || root.forti.state === "disconnecting" || root.forti.cleanupRequired || root.fortiSwitchTarget !== "" || root.nmSwitchTarget !== "" || root.azureSwitchTarget !== ""
+    running: root.fortiPending || root.forti.state === "connecting" || root.forti.state === "disconnecting" || root.forti.cleanupRequired || root.gpPending || root.gp.running || root.gp.stopping || root.fortiSwitchTarget !== "" || root.nmSwitchTarget !== "" || root.azureSwitchTarget !== "" || root.gpSwitchTarget !== ""
     onTriggered: root.pollAzure()
   }
   Process {
@@ -185,6 +194,17 @@ Item {
         }
         if (result.state !== undefined) {
           root.azure = result
+        }
+        if (result.gp !== undefined) {
+          root.gp = result.gp
+          if (root.gp.connected) {
+            root.clearResolvedMessage()
+          }
+          if (root.gp.error) {
+            root.lastError = root.gp.error
+            root.lastMessage = ""
+            root.pendingAction = ""
+          }
         }
         if (result.forti !== undefined) {
           root.forti = result.forti
@@ -227,22 +247,32 @@ Item {
             root.pendingAction = ""
             root.lastMessage = ""
             root.profileAction("launch", targetPath)
+          } else if (root.gpSwitchTarget !== "" && !root.forti.connected && !root.forti.cleanupRequired &&
+                     !root.fortiPending && root.forti.state === "disconnected" &&
+                     !root.gp.connected && !root.gp.running && !root.gp.stopping) {
+            var targetPortal = root.gpSwitchTarget
+            root.gpSwitchTarget = ""
+            root.pendingAction = ""
+            root.lastMessage = ""
+            root.profileAction("launch-gp", targetPortal)
           } else if (root.forti.cleanupRequired || root.forti.error) {
             root.fortiSwitchTarget = ""
             root.nmSwitchTarget = ""
             root.azureSwitchTarget = ""
+            root.gpSwitchTarget = ""
           }
         }
         if (root.azureOperation.error) {
           root.lastError = root.azureOperation.error
           root.lastMessage = ""
           root.pendingAction = ""
-        } else if (!result.forti || (!result.forti.error && !result.forti.passwordRequired)) {
+        } else if ((!result.forti || (!result.forti.error && !result.forti.passwordRequired)) && (!result.gp || !result.gp.error)) {
           root.clearResolvedMessage()
         }
       } catch (e) {
         root.azure = {state: "unknown", connected: false, path: "", interface: "", address: ""}
         root.azureOperation = {known: false, running: null, stopping: null, error: ""}
+        root.gp = {installed: false, known: false, state: "unknown", connected: false, running: false, stopping: false, portal: "", interface: "", address: "", error: ""}
       }
     }
   }
@@ -252,11 +282,17 @@ Item {
     if ((pendingAction === "launch" && azure.connected) ||
         ((pendingAction === "connect-forti" || pendingAction === "connect-forti-pass") && forti.connected) ||
         (pendingAction === "disconnect-forti" && !forti.connected && !forti.cleanupRequired) ||
+        (pendingAction === "launch-gp" && gp.connected) ||
+        (pendingAction === "disconnect-gp" && !gp.connected && !gp.running && !gp.stopping) ||
         (pendingAction === "disconnect" && azure.state === "disconnected" && azureOperationKnown && !azureOperation.running && !azureOperation.stopping)) {
       lastMessage = ""
       pendingAction = ""
     }
     if (forti.connected && (lastMessage.indexOf("Connecting to FortiClient") !== -1 || pendingAction === "connect-forti" || pendingAction === "connect-forti-pass")) {
+      lastMessage = ""
+      pendingAction = ""
+    }
+    if (gp.connected && (lastMessage.indexOf("Connecting to GlobalProtect") !== -1 || pendingAction === "launch-gp")) {
       lastMessage = ""
       pendingAction = ""
     }
@@ -269,6 +305,10 @@ Item {
     }
     if (azureOperation.path === path && azureOperation.running) {
       profileAction("disconnect")
+      return
+    }
+    if (gp.connected || gp.running) {
+      profileAction("disconnect-gp")
       return
     }
     if (forti.connected) {
@@ -296,6 +336,10 @@ Item {
       profileAction("disconnect-forti")
       return
     }
+    if (gp.connected || gp.running) {
+      profileAction("disconnect-gp")
+      return
+    }
     if (azure.connected || azureOperation.running) {
       profileAction("disconnect")
       return
@@ -307,6 +351,46 @@ Item {
     root.lastError = ""
     root.fortiRequestReason = ""
     profileAction("connect-forti", name)
+  }
+  function toggleGp(portal) {
+    if (gp.stopping) return
+    if (gp.portal === portal && (gp.connected || gp.running)) {
+      profileAction("disconnect-gp")
+      return
+    }
+    if (gp.connected || gp.running) {
+      gpSwitchTarget = portal
+      profileAction("disconnect-gp")
+      return
+    }
+    if (forti.connected) {
+      gpSwitchTarget = portal
+      profileAction("disconnect-forti")
+      return
+    }
+    if (azure.connected || azureOperation.running) {
+      profileAction("disconnect")
+      return
+    }
+    if (nmActive) {
+      disconnectNm()
+      return
+    }
+    root.lastError = ""
+    profileAction("launch-gp", portal)
+  }
+  function addGp(portal) {
+    profileAction("add-gp", portal)
+  }
+  function canRemoveGp(portal) {
+    return gpProfiles.indexOf(portal) !== -1 && !actionRunning && !importProcess.running &&
+      !gp.running && !gp.stopping && !(gp.connected && gp.portal === portal)
+  }
+  function removeGp(portal) {
+    if (canRemoveGp(portal)) profileAction("remove-gp", portal)
+  }
+  function disconnectGp() {
+    profileAction("disconnect-gp")
   }
   function deleteForti(name) {
     profileAction("delete-forti", name)
@@ -380,10 +464,10 @@ Item {
   function profileAction(action, path, input, extra) {
     if (importProcess.running || actionRunning) return
     if (action === "launch" && (!azureOperationKnown || azureOperation.running || azureOperation.stopping || azure.state !== "disconnected")) return
-    if (action === "launch" || action === "disconnect" || action === "connect-forti" || action === "connect-forti-pass" || action === "disconnect-forti") {
+    if (action === "launch" || action === "disconnect" || action === "connect-forti" || action === "connect-forti-pass" || action === "disconnect-forti" || action === "launch-gp" || action === "disconnect-gp") {
       lastError = ""
       pendingAction = action
-      lastMessage = (action === "launch" || action === "connect-forti" || action === "connect-forti-pass") ? "Connecting…" : "Disconnecting…"
+      lastMessage = (action === "launch" || action === "connect-forti" || action === "connect-forti-pass" || action === "launch-gp") ? "Connecting…" : "Disconnecting…"
     }
     importProcess.environment = {}
     var cmd = ["/usr/bin/python3", decodeURIComponent(Qt.resolvedUrl("profiles.py").toString().replace(/^file:\/\//, "")), action]
@@ -408,6 +492,7 @@ Item {
         if (result.cancelled) { root.pendingAction = ""; root.lastMessage = ""; return }
         if (result.azure !== undefined) root.azureProfiles = result.azure
         if (result.forti !== undefined && result.fortiOk !== false) root.fortiProfiles = result.forti
+        if (result.gp !== undefined) root.gpProfiles = result.gp
         if (result.passwordRequired) {
           root.fortiRequest = result.passwordRequired
           root.fortiRequestReason = result.reason || ""
@@ -453,6 +538,7 @@ Item {
         // Keep the Forti rows reconciled on every refresh; skip a failed read
         // so a CLI hiccup cannot blank existing profiles.
         if (result.forti !== undefined && result.fortiOk !== false) root.fortiProfiles = result.forti
+        if (result.gp !== undefined) root.gpProfiles = result.gp
       } catch (e) { /* keep last known list; next refresh retries */ }
     }
   }
@@ -504,7 +590,7 @@ Item {
   property string _ipOutput: ""
   property string _actionOutput: ""
 
-  readonly property bool active: azure.connected || forti.connected || (nmStateKnown && nmUuid !== "")
+  readonly property bool active: azure.connected || forti.connected || gp.connected || (nmStateKnown && nmUuid !== "")
   readonly property int refreshIntervalSec: intSetting(
     "refreshIntervalSec",
     10,
@@ -632,6 +718,10 @@ Item {
       profileAction("disconnect")
       return
     }
+    if (gp.connected || gp.running || gp.stopping) {
+      profileAction("disconnect-gp")
+      return
+    }
     if (forti.connected || forti.cleanupRequired) {
       profileAction("disconnect-forti")
       return
@@ -674,6 +764,10 @@ Item {
 
     if (azure.connected || azureOperation.running) {
       profileAction("disconnect")
+      return
+    }
+    if (gp.connected || gp.running) {
+      profileAction("disconnect-gp")
       return
     }
     if (forti.connected) {

@@ -15,6 +15,7 @@ Panel {
 
   property int profileIndex: 0
   property bool cursorActive: false
+  property bool gpAddOpen: false
 
   readonly property color foreground:
     bar ? bar.foreground : Color.foreground
@@ -52,6 +53,8 @@ Panel {
     })
   } else {
     permissionField.text = ""
+    gpPortalField.text = ""
+    root.gpAddOpen = false
     vpn.lastError = ""
     vpn.cancelAuth()
   }
@@ -135,7 +138,7 @@ Panel {
     }
   }
 
-  readonly property int profileCount: vpn.profiles.length + vpn.azureProfiles.length + (vpn.fortiProfiles ? vpn.fortiProfiles.length : 0)
+  readonly property int profileCount: vpn.profiles.length + vpn.azureProfiles.length + (vpn.fortiProfiles ? vpn.fortiProfiles.length : 0) + (vpn.gpProfiles ? vpn.gpProfiles.length : 0)
 
   function selectedProfile() {
     if (profileIndex < vpn.profiles.length)
@@ -146,8 +149,13 @@ Panel {
       return { type: "azure", path: vpn.azureProfiles[azureIndex] }
 
     var fortiIndex = azureIndex - vpn.azureProfiles.length
-    if (vpn.fortiProfiles && fortiIndex < vpn.fortiProfiles.length)
+    var fortiLen = vpn.fortiProfiles ? vpn.fortiProfiles.length : 0
+    if (fortiIndex < fortiLen)
       return { type: "forti", name: vpn.fortiProfiles[fortiIndex] }
+
+    var gpIndex = fortiIndex - fortiLen
+    if (vpn.gpProfiles && gpIndex < vpn.gpProfiles.length)
+      return { type: "gp", portal: vpn.gpProfiles[gpIndex] }
 
     return null
   }
@@ -171,6 +179,8 @@ Panel {
     var profile = selectedProfile()
     if (profile && profile.type === "forti")
       vpn.disconnectForti()
+    else if (profile && profile.type === "gp")
+      vpn.disconnectGp()
     else if (profile && profile.uuid && ["connected", "connecting", "disconnecting"].indexOf(vpn.nmRowStatus(profile.uuid)) !== -1)
       vpn.disconnectNm(profile.uuid)
     else vpn.disconnectActive()
@@ -186,6 +196,8 @@ Panel {
       if (profile.path !== undefined) vpn.toggleAzure(profile.path)
     } else if (profile.type === "forti") {
       if (profile.name !== undefined) vpn.toggleForti(profile.name)
+    } else if (profile.type === "gp") {
+      if (profile.portal !== undefined) vpn.toggleGp(profile.portal)
     } else vpn.toggleProfile(profile.uuid)
   }
 
@@ -276,7 +288,7 @@ Panel {
     bar: root.bar
     open: root.opened
 
-    focusTarget: vpn.authRequest ? permissionField : keyCatcher
+    focusTarget: vpn.authRequest ? permissionField : (root.gpAddOpen ? gpPortalField : keyCatcher)
 
     contentWidth:
       panel.fittedContentWidth(Style.space(380))
@@ -289,7 +301,7 @@ Panel {
 
     PanelKeyCatcher {
       id: keyCatcher
-      blocked: vpn.authRequest !== ""
+      blocked: vpn.authRequest !== "" || root.gpAddOpen
 
       anchors.fill: parent
 
@@ -323,6 +335,12 @@ Panel {
 
         else if (t === "f" || t === "F")
           vpn.profileAction("form-forti")
+
+        else if (t === "g" || t === "G") {
+          root.gpAddOpen = true
+          panelFlick.contentY = 0
+          Qt.callLater(function() { gpPortalField.forceActiveFocus() })
+        }
 
         else if (t === "d" || t === "D")
           root.disconnectSelected()
@@ -466,6 +484,94 @@ Panel {
                   text: "Cancel"
                   onClicked: { permissionField.text = ""; vpn.cancelAuth() }
                   Keys.onEscapePressed: { permissionField.text = ""; vpn.cancelAuth() }
+                }
+              }
+            }
+          }
+
+          Rectangle {
+            id: gpAddCard
+            width: parent.width
+            implicitHeight: gpAddColumn.implicitHeight + Style.space(24)
+            visible: root.gpAddOpen && vpn.authRequest === ""
+            radius: Style.space(6)
+            color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.12)
+            border.width: 1
+            border.color: root.accent
+
+            Column {
+              id: gpAddColumn
+              anchors {
+                left: parent.left
+                right: parent.right
+                top: parent.top
+                margins: Style.space(12)
+              }
+              spacing: Style.space(8)
+
+              Text {
+                width: parent.width
+                text: "Add GlobalProtect portal"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+              }
+              Text {
+                width: parent.width
+                text: "Enter the portal hostname (e.g. vpn.example.org). It will appear as a toggle in VPN PROFILES."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.Wrap
+              }
+              NativeUi.TextField {
+                id: gpPortalField
+                width: parent.width
+                maximumLength: 260
+                placeholderText: "vpn.company.com"
+                foreground: root.foreground
+                accent: root.accent
+                Accessible.name: "GlobalProtect portal hostname"
+                function submit() {
+                  var value = text.trim()
+                  if (value === "") return
+                  text = ""
+                  root.gpAddOpen = false
+                  vpn.addGp(value)
+                  Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+                }
+                onAccepted: submit()
+                Keys.onReturnPressed: function(event) { event.accepted = true; submit() }
+                Keys.onEnterPressed: function(event) { event.accepted = true; submit() }
+                Keys.onEscapePressed: {
+                  text = ""
+                  root.gpAddOpen = false
+                  Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+                }
+              }
+              Row {
+                spacing: Style.space(8)
+                Button {
+                  focusable: true
+                  Accessible.role: Accessible.Button
+                  Accessible.name: "Add GlobalProtect portal"
+                  Accessible.onPressAction: clicked()
+                  text: "Add"
+                  enabled: gpPortalField.text.trim().length > 0 && !vpn.importing
+                  onClicked: gpPortalField.submit()
+                }
+                Button {
+                  focusable: true
+                  Accessible.role: Accessible.Button
+                  Accessible.name: "Cancel adding GlobalProtect portal"
+                  Accessible.onPressAction: clicked()
+                  text: "Cancel"
+                  onClicked: {
+                    gpPortalField.text = ""
+                    root.gpAddOpen = false
+                    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+                  }
                 }
               }
             }
@@ -1086,6 +1192,95 @@ Panel {
                   ToolTip.text: modelData + " (FortiClient) · " + (vpn.fortiRowStatus(modelData))
                 }
               }
+              Repeater {
+                model: vpn.gpProfiles
+                delegate: Rectangle {
+                  required property string modelData
+                  required property int index
+                  readonly property int gpRowIndex: vpn.profiles.length + vpn.azureProfiles.length + (vpn.fortiProfiles ? vpn.fortiProfiles.length : 0) + index
+                  width: profileColumn.width
+                  implicitHeight: gpRow.implicitHeight + Style.space(12)
+                  radius: Style.space(4)
+                  color: vpn.gp.connected && vpn.gp.portal === modelData
+                    ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.18)
+                    : (root.cursorActive && root.profileIndex === gpRowIndex
+                      ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08) : "transparent")
+                  Row {
+                    id: gpRow
+                    anchors {
+                      left: parent.left
+                      right: parent.right
+                      verticalCenter: parent.verticalCenter
+                      leftMargin: Style.space(8)
+                      rightMargin: Style.space(8)
+                    }
+                    spacing: Style.space(8)
+                    Text {
+                      id: gpIndicator
+                      text: vpn.gp.connected && vpn.gp.portal === modelData ? "●" : "○"
+                      color: vpn.gp.connected && vpn.gp.portal === modelData ? root.accent : root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                    }
+                    Column {
+                      width: Math.max(0, parent.width - gpIndicator.width - gpBadge.width - gpSwitch.width - gpDelete.width - parent.spacing * 4)
+                      spacing: Style.space(1)
+                      Text {
+                        width: parent.width
+                        text: modelData
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                        elide: Text.ElideRight
+                      }
+                      Text {
+                        width: parent.width
+                        elide: Text.ElideRight
+                        text: vpn.gpRowStatus(modelData)
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+                    KindBadge {
+                      id: gpBadge
+                      anchors.verticalCenter: parent.verticalCenter
+                      kind: "GP"
+                      connected: vpn.gp.connected && vpn.gp.portal === modelData
+                    }
+                    ToggleSwitch {
+                      id: gpSwitch
+                      anchors.verticalCenter: parent.verticalCenter
+                      checked: vpn.gp.connected && vpn.gp.portal === modelData
+                      busy: vpn.importing || vpn.actionRunning || vpn.gp.stopping || (vpn.gp.running && !vpn.gp.connected && vpn.gp.portal !== modelData)
+                      foreground: root.foreground
+                      accent: root.accent
+                      hasCursor: root.cursorActive && root.profileIndex === gpRowIndex
+                      Accessible.role: Accessible.CheckBox
+                      Accessible.name: modelData
+                      Accessible.checked: checked
+                      Accessible.onToggleAction: if (!busy) toggled()
+                      onToggled: {
+                        root.cursorActive = true
+                        root.profileIndex = gpRowIndex
+                        vpn.toggleGp(modelData)
+                      }
+                    }
+                    DeleteControl {
+                      id: gpDelete
+                      anchors.verticalCenter: parent.verticalCenter
+                      target: modelData
+                      label: modelData
+                      azureRegistry: true
+                      enabled: vpn.canRemoveGp(target) && !vpn.authRequest
+                      onConfirmed: vpn.removeGp(target)
+                    }
+                  }
+                  HoverHandler { id: gpHover }
+                  ToolTip.visible: gpHover.hovered
+                  ToolTip.text: modelData + " (GlobalProtect) · " + (vpn.gpRowStatus(modelData))
+                }
+              }
             }
           }
 
@@ -1093,18 +1288,29 @@ Panel {
             width: parent.width
             spacing: Style.space(8)
             Button {
-              width: Math.floor((parent.width - parent.spacing) / 2)
+              width: Math.floor((parent.width - parent.spacing * 2) / 3)
               text: vpn.importing ? "Working…" : "Import (I)"
               enabled: !vpn.importing && !vpn.actionRunning
               Accessible.name: "Import VPN profile"
               onClicked: vpn.profileAction("import")
             }
             Button {
-              width: Math.floor((parent.width - parent.spacing) / 2)
+              width: Math.floor((parent.width - parent.spacing * 2) / 3)
               text: "New Forti (F)"
               enabled: !vpn.importing && !vpn.actionRunning
               Accessible.name: "Add FortiClient VPN profile"
               onClicked: vpn.profileAction("form-forti")
+            }
+            Button {
+              width: Math.floor((parent.width - parent.spacing * 2) / 3)
+              text: "New GP (G)"
+              enabled: !vpn.importing && !vpn.actionRunning
+              Accessible.name: "Add GlobalProtect VPN profile"
+              onClicked: {
+                root.gpAddOpen = true
+                panelFlick.contentY = 0
+                Qt.callLater(function() { gpPortalField.forceActiveFocus() })
+              }
             }
           }
 
@@ -1167,7 +1373,7 @@ Panel {
             width: parent.width
 
             text:
-              "↑↓ select · Enter connect/disconnect · D disconnect · R refresh · I import · F new forti"
+              "↑↓ select · Enter connect/disconnect · D disconnect · R refresh · I import · F forti · G gp"
 
             color:
               root.dim
